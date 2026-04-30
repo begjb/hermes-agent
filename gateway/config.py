@@ -693,10 +693,26 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["reply_in_thread"] = platform_cfg["reply_in_thread"]
                 if "require_mention" in platform_cfg:
                     bridged["require_mention"] = platform_cfg["require_mention"]
+                if plat == Platform.SLACK and "strict_mention" in platform_cfg:
+                    bridged["strict_mention"] = platform_cfg["strict_mention"]
                 if "free_response_channels" in platform_cfg:
                     bridged["free_response_channels"] = platform_cfg["free_response_channels"]
                 if "mention_patterns" in platform_cfg:
                     bridged["mention_patterns"] = platform_cfg["mention_patterns"]
+                if plat == Platform.SLACK and "mention_aliases" in platform_cfg:
+                    mention_aliases = platform_cfg["mention_aliases"]
+                    if isinstance(mention_aliases, dict):
+                        bridged["mention_aliases"] = {str(k): v for k, v in mention_aliases.items()}
+                    else:
+                        bridged["mention_aliases"] = mention_aliases
+                if plat == Platform.SLACK and "context_channels" in platform_cfg:
+                    context_channels = platform_cfg["context_channels"]
+                    if isinstance(context_channels, dict):
+                        bridged["context_channels"] = {str(k): v for k, v in context_channels.items()}
+                    else:
+                        bridged["context_channels"] = context_channels
+                if plat == Platform.SLACK and "suppress_internal_terms_channels" in platform_cfg:
+                    bridged["suppress_internal_terms_channels"] = platform_cfg["suppress_internal_terms_channels"]
                 if "dm_policy" in platform_cfg:
                     bridged["dm_policy"] = platform_cfg["dm_policy"]
                 if "allow_from" in platform_cfg:
@@ -713,6 +729,14 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = {str(k): v for k, v in channel_prompts.items()}
                     else:
                         bridged["channel_prompts"] = channel_prompts
+                if "channel_prompt_files" in platform_cfg:
+                    channel_prompt_files = platform_cfg["channel_prompt_files"]
+                    if isinstance(channel_prompt_files, dict):
+                        bridged["channel_prompt_files"] = {
+                            str(k): v for k, v in channel_prompt_files.items()
+                        }
+                    else:
+                        bridged["channel_prompt_files"] = channel_prompt_files
                 enabled_was_explicit = "enabled" in platform_cfg
                 if not bridged and not enabled_was_explicit:
                     continue

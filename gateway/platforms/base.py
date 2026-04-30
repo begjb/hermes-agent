@@ -17,6 +17,7 @@ import subprocess
 import sys
 import uuid
 from abc import ABC, abstractmethod
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
@@ -1079,27 +1080,73 @@ def resolve_channel_prompt(
 ) -> str | None:
     """Resolve a per-channel ephemeral prompt from platform config.
 
-    Looks up ``channel_prompts`` in the adapter's ``config.extra`` dict.
+    Looks up ``channel_prompts`` and ``channel_prompt_files`` in the adapter's
+    ``config.extra`` dict.
     Prefers an exact match on *channel_id*; falls back to *parent_id*
     (useful for forum threads / child channels inheriting a parent prompt).
 
     Returns the prompt string, or None if no match is found.  Blank/whitespace-
     only prompts are treated as absent.
     """
-    prompts = config_extra.get("channel_prompts") or {}
-    if not isinstance(prompts, dict):
-        return None
+    prompt = _resolve_channel_prompt_value(config_extra.get("channel_prompts"), channel_id, parent_id)
+    if prompt:
+        return prompt
 
+    prompt_files = _resolve_channel_prompt_value(
+        config_extra.get("channel_prompt_files"),
+        channel_id,
+        parent_id,
+    )
+    if prompt_files:
+        return _read_channel_prompt_files(prompt_files)
+
+    return None
+
+
+def _resolve_channel_prompt_value(
+    mapping: object,
+    channel_id: str,
+    parent_id: str | None = None,
+) -> object | None:
+    if not isinstance(mapping, dict):
+        return None
     for key in (channel_id, parent_id):
         if not key:
             continue
-        prompt = prompts.get(key)
+        prompt = mapping.get(key)
         if prompt is None:
             continue
+        if isinstance(prompt, (list, tuple)):
+            return prompt
         prompt = str(prompt).strip()
         if prompt:
             return prompt
     return None
+
+
+def _read_channel_prompt_files(value: object) -> str | None:
+    values = value if isinstance(value, (list, tuple)) else [value]
+    parts: list[str] = []
+    for item in values:
+        raw_path = str(item or "").strip()
+        if not raw_path:
+            continue
+        expanded = os.path.expandvars(os.path.expanduser(raw_path))
+        path = Path(expanded)
+        if not path.is_absolute():
+            from hermes_cli.config import get_hermes_home
+
+            path = get_hermes_home() / path
+        try:
+            content = path.read_text(encoding="utf-8").strip()
+        except Exception as exc:
+            logger.warning("Failed to read channel prompt file %s: %s", path, exc)
+            continue
+        if content:
+            parts.append(content)
+    if not parts:
+        return None
+    return "\n\n".join(parts)
 
 
 def resolve_channel_skills(

@@ -277,7 +277,15 @@ class SlackAdapter(BasePlatformAdapter):
         self._handler: Optional[Any] = None
         self._bot_user_id: Optional[str] = None
         self._user_name_cache: Dict[str, str] = {}  # user_id → display name
+        self._user_profile_cache: Dict[str, Dict[str, Any]] = {}
         self._socket_mode_task: Optional[asyncio.Task] = None
+        # Optional Web API polling fallback for private channels where Slack
+        # Socket Mode connects but event subscriptions do not deliver message
+        # payloads. Polled events still flow through the normal Slack handler.
+        self._polling_task: Optional[asyncio.Task] = None
+        self._poll_seen: set = set()
+        self._POLL_SEEN_MAX = 5000
+        self._poll_started_at: float = 0.0
         # Multi-workspace support
         self._team_clients: Dict[str, Any] = {}   # team_id → WebClient
         self._team_bot_user_ids: Dict[str, str] = {}          # team_id → bot_user_id
@@ -305,6 +313,18 @@ class SlackAdapter(BasePlatformAdapter):
         # Cache for _fetch_thread_context results: cache_key → _ThreadContextCache
         self._thread_context_cache: Dict[str, _ThreadContextCache] = {}
         self._THREAD_CACHE_TTL = 60.0
+        # Cached per-channel roster context so the agent knows who is present
+        # in a private Slack workroom without inferring from message history.
+        self._channel_audience_cache: Dict[str, Tuple[float, str]] = {}
+        self._CHANNEL_AUDIENCE_TTL = 600.0
+        # Cached per-channel mention aliases built from Slack channel members.
+        # Manual config aliases remain supported as overrides.
+        self._auto_mention_alias_cache: Dict[str, Tuple[float, Dict[str, str]]] = {}
+        # Cached read-only context from related Slack channels. This lets a
+        # workroom answer from recent operational channel activity without
+        # making the bot reply in those related channels.
+        self._related_channel_context_cache: Dict[str, Tuple[float, str]] = {}
+        self._RELATED_CHANNEL_CONTEXT_TTL = 60.0
         # Track message IDs that should get reaction lifecycle (DMs / @mentions).
         self._reacting_message_ids: set = set()
         # Track active assistant thread status indicators so stop_typing can
@@ -446,12 +466,14 @@ class SlackAdapter(BasePlatformAdapter):
             async def handle_message_event(event, say):
                 await self._handle_slack_message(event)
 
-            # Acknowledge app_mention events to prevent Bolt 404 errors.
-            # The "message" handler above already processes @mentions in
-            # channels, so this is intentionally a no-op to avoid duplicates.
+            # Private-channel Slack apps may receive app_mention events even
+            # when the broader message event subscription is not delivered.
+            # Route mentions through the normal message handler; its timestamp
+            # dedup cache prevents duplicate responses when both event types
+            # arrive for the same Slack message.
             @self._app.event("app_mention")
             async def handle_app_mention(event, say):
-                pass
+                await self._handle_slack_message(event)
 
             # File lifecycle events can arrive around snippet uploads even when
             # the actual user message is what we care about. Ack them so Slack
@@ -528,6 +550,15 @@ class SlackAdapter(BasePlatformAdapter):
             _apply_slack_proxy(self._handler.client, proxy_url)
             self._socket_mode_task = asyncio.create_task(self._handler.start_async())
 
+            poll_channels = self._slack_poll_channels()
+            if poll_channels:
+                self._poll_started_at = time.time()
+                self._polling_task = asyncio.create_task(self._poll_slack_channels())
+                logger.info(
+                    "[Slack] Web API polling fallback enabled for %d channel(s)",
+                    len(poll_channels),
+                )
+
             self._running = True
             logger.info(
                 "[Slack] Socket Mode connected (%d workspace(s))",
@@ -544,6 +575,16 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Disconnect from Slack."""
+        if self._polling_task:
+            self._polling_task.cancel()
+            try:
+                await self._polling_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:  # pragma: no cover - defensive logging
+                logger.warning("[Slack] Error while stopping polling fallback: %s", e, exc_info=True)
+            self._polling_task = None
+
         if self._handler:
             try:
                 await self._handler.close_async()
@@ -554,6 +595,370 @@ class SlackAdapter(BasePlatformAdapter):
         self._release_platform_lock()
 
         logger.info("[Slack] Disconnected")
+
+    def _slack_poll_channels(self) -> List[str]:
+        raw = (
+            self.config.extra.get("poll_channels", "")
+            or os.getenv("SLACK_POLL_CHANNELS", "")
+        )
+        if isinstance(raw, list):
+            return [str(c).strip() for c in raw if str(c).strip()]
+        return [c.strip() for c in str(raw).split(",") if c.strip()]
+
+    def _slack_poll_interval(self) -> float:
+        raw = self.config.extra.get("poll_interval") or os.getenv("SLACK_POLL_INTERVAL", "5")
+        try:
+            return max(2.0, float(raw))
+        except (TypeError, ValueError):
+            return 5.0
+
+    def _slack_poll_lookback(self) -> float:
+        raw = self.config.extra.get("poll_lookback_seconds") or os.getenv("SLACK_POLL_LOOKBACK_SECONDS", "900")
+        try:
+            return max(60.0, float(raw))
+        except (TypeError, ValueError):
+            return 900.0
+
+    def _slack_suppress_internal_terms_channels(self) -> List[str]:
+        raw = (
+            self.config.extra.get("suppress_internal_terms_channels", "")
+            or os.getenv("SLACK_SUPPRESS_INTERNAL_TERMS_CHANNELS", "")
+        )
+        if isinstance(raw, list):
+            return [str(c).strip() for c in raw if str(c).strip()]
+        return [c.strip() for c in str(raw).split(",") if c.strip()]
+
+    def _sanitize_private_workroom_output(self, chat_id: str, content: str) -> str:
+        """Remove internal implementation leaks before posting to private Slack workrooms."""
+        if not content or chat_id not in self._slack_suppress_internal_terms_channels():
+            return content
+
+        content = re.sub(
+            r"\bnot\s+board[- ]visible\s+by\s+default\b",
+            "not automatically part of board materials",
+            content,
+            flags=re.IGNORECASE,
+        )
+        content = re.sub(
+            r"\bboard[- ]visible\s+by\s+default\b",
+            "automatically part of board materials",
+            content,
+            flags=re.IGNORECASE,
+        )
+        content = re.sub(
+            r"\bboard[- ]visible\b",
+            "part of board materials",
+            content,
+            flags=re.IGNORECASE,
+        )
+        content = re.sub(
+            r"\bsource material\b",
+            "reference material",
+            content,
+            flags=re.IGNORECASE,
+        )
+        content = re.sub(
+            r"source boundar(?:y|ies)",
+            "submission status",
+            content,
+            flags=re.IGNORECASE,
+        )
+
+        forbidden = re.compile(
+            r"\bKM\b|\bHelios\b|\bSteward\b|\bPartner\b|semantic contracts?|"
+            r"\bingest(?:ion|ed|s)?\b|\btools?\b|"
+            r"\bprompts?\b|standing rule|database|memory system",
+            re.IGNORECASE,
+        )
+        if not forbidden.search(content):
+            return content
+
+        kept: List[str] = []
+        for line in content.splitlines():
+            if forbidden.search(line):
+                continue
+            kept.append(line)
+
+        sanitized = "\n".join(kept).strip()
+        sanitized = re.sub(r"\n{3,}", "\n\n", sanitized)
+        if sanitized and not forbidden.search(sanitized):
+            logger.info("[Slack] Suppressed internal implementation terms for channel %s", chat_id)
+            return sanitized
+
+        logger.warning("[Slack] Replaced response containing internal implementation terms for channel %s", chat_id)
+        return (
+            "I have the standing operational context, but I do not have a confirmed "
+            "latest scheduling update in this thread. Please verify against the "
+            "latest EA scheduling notice before treating the date as final."
+        )
+
+    def _slack_mention_cache_key(self, chat_id: str) -> str:
+        team_id = self._channel_team.get(chat_id, "")
+        return f"{team_id}:{chat_id}"
+
+    @staticmethod
+    def _normalize_slack_alias_key(alias: str) -> str:
+        cleaned = re.sub(r"[\s\u00a0]+", " ", str(alias or "").strip().lstrip("@"))
+        return cleaned.casefold()
+
+    @classmethod
+    def _safe_auto_slack_alias(cls, alias: str) -> str:
+        cleaned = re.sub(r"[\s\u00a0]+", " ", str(alias or "").strip().lstrip("@"))
+        if not cleaned or cleaned.startswith(("<@", "<!")):
+            return ""
+        if re.fullmatch(r"[UW][A-Z0-9]+", cleaned, re.IGNORECASE):
+            return ""
+        # Auto aliases should be specific enough to avoid accidental mentions.
+        # Full names and Slack handles are fine; bare first names are not.
+        if not re.search(r"[\s._-]", cleaned):
+            return ""
+        return cleaned
+
+    @classmethod
+    def _slack_alias_candidates_for_profile(cls, profile: Dict[str, Any]) -> List[str]:
+        candidates: List[str] = []
+        for key in (
+            "display_name",
+            "display_name_normalized",
+            "real_name",
+            "real_name_normalized",
+            "name",
+        ):
+            value = str(profile.get(key, "") or "").strip()
+            safe = cls._safe_auto_slack_alias(value)
+            if safe:
+                candidates.append(safe)
+                if " " in safe:
+                    dotted = ".".join(part for part in safe.split(" ") if part)
+                    dotted = cls._safe_auto_slack_alias(dotted)
+                    if dotted:
+                        candidates.append(dotted)
+
+        seen: set[str] = set()
+        unique: List[str] = []
+        for candidate in candidates:
+            key = cls._normalize_slack_alias_key(candidate)
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(candidate)
+        return unique
+
+    @classmethod
+    def _build_slack_mention_aliases_from_profiles(
+        cls,
+        profiles: List[Dict[str, Any]],
+    ) -> Dict[str, str]:
+        alias_to_user: Dict[str, str] = {}
+        alias_display: Dict[str, str] = {}
+        collisions: set[str] = set()
+
+        for profile in profiles:
+            user_id = str(profile.get("id", "") or "").strip()
+            if not user_id or profile.get("deleted") or profile.get("is_bot"):
+                continue
+            for alias in cls._slack_alias_candidates_for_profile(profile):
+                key = cls._normalize_slack_alias_key(alias)
+                if not key or key in collisions:
+                    continue
+                existing = alias_to_user.get(key)
+                if existing and existing != user_id:
+                    collisions.add(key)
+                    alias_to_user.pop(key, None)
+                    alias_display.pop(key, None)
+                    continue
+                alias_to_user[key] = user_id
+                alias_display[key] = alias
+
+        return {
+            alias_display[key]: user_id
+            for key, user_id in alias_to_user.items()
+            if key not in collisions
+        }
+
+    def _configured_slack_mention_aliases(self, chat_id: str) -> Dict[str, str]:
+        """Return manually configured plain-name aliases for Slack mentions."""
+        configured = self.config.extra.get("mention_aliases")
+        if not isinstance(configured, dict):
+            return {}
+
+        raw = configured.get(chat_id)
+        if raw is None:
+            raw = configured.get("*")
+        if not isinstance(raw, dict):
+            return {}
+
+        aliases: Dict[str, str] = {}
+        for alias, user_id in raw.items():
+            alias_text = str(alias).strip()
+            user_id_text = str(user_id).strip()
+            if alias_text and re.fullmatch(r"[UW][A-Z0-9]+", user_id_text):
+                aliases[alias_text] = user_id_text
+        return aliases
+
+    def _auto_slack_mention_aliases(self, chat_id: str) -> Dict[str, str]:
+        cache_key = self._slack_mention_cache_key(chat_id)
+        cached = self._auto_mention_alias_cache.get(cache_key)
+        if not cached:
+            return {}
+        fetched_at, aliases = cached
+        if (time.monotonic() - fetched_at) >= self._CHANNEL_AUDIENCE_TTL:
+            return {}
+        return dict(aliases)
+
+    def _slack_mention_aliases(self, chat_id: str) -> Dict[str, str]:
+        """Return plain-name aliases that should become real Slack mentions."""
+        aliases = self._auto_slack_mention_aliases(chat_id)
+        aliases.update(self._configured_slack_mention_aliases(chat_id))
+        return aliases
+
+    async def _ensure_slack_mention_aliases(self, chat_id: str) -> None:
+        """Refresh auto-built mention aliases when a channel roster is stale."""
+        if not chat_id or chat_id.startswith("D"):
+            return
+        cache_key = self._slack_mention_cache_key(chat_id)
+        cached = self._auto_mention_alias_cache.get(cache_key)
+        if cached and (time.monotonic() - cached[0]) < self._CHANNEL_AUDIENCE_TTL:
+            return
+        team_id = self._channel_team.get(chat_id, "")
+        await self._fetch_channel_audience_prompt(chat_id, is_dm=False, team_id=team_id)
+
+    def _apply_slack_mention_aliases(self, chat_id: str, content: str) -> str:
+        """Convert configured plain @names into Slack's real <@USERID> mentions."""
+        if not content:
+            return content
+
+        aliases = self._slack_mention_aliases(chat_id)
+        if not aliases:
+            return content
+
+        converted = content
+        for alias, user_id in sorted(aliases.items(), key=lambda item: len(item[0]), reverse=True):
+            alias_parts = re.split(r"\s+", alias.strip())
+            alias_pattern = r"[\s\u00a0]+".join(re.escape(part) for part in alias_parts if part)
+            pattern = re.compile(
+                rf"(?<![<\w.-])@{alias_pattern}(?![\w.-])",
+                re.IGNORECASE,
+            )
+            converted = pattern.sub(f"<@{user_id}>", converted)
+
+        return converted
+
+    @staticmethod
+    def _starts_with_other_slack_user_mention(text: str, bot_uid: Optional[str]) -> bool:
+        """Return true when a channel message is visibly addressed to another user."""
+        if not text or not bot_uid:
+            return False
+        stripped = re.sub(r"^[\s>•*\-]+", "", text)
+        match = re.match(r"^<@([UW][A-Z0-9]+)>(?:[\s,;:—-]|$)", stripped)
+        return bool(match and match.group(1) != bot_uid)
+
+    async def _poll_slack_channels(self) -> None:
+        """Poll selected Slack channels and route new messages normally."""
+        await asyncio.sleep(1.0)
+        while self._running:
+            channels = self._slack_poll_channels()
+            for channel_id in channels:
+                try:
+                    await self._poll_slack_channel(channel_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # pragma: no cover - defensive logging
+                    logger.warning("[Slack] Polling fallback failed for %s: %s", channel_id, e, exc_info=True)
+            await asyncio.sleep(self._slack_poll_interval())
+
+    async def _poll_slack_channel(self, channel_id: str) -> None:
+        if not self._team_clients:
+            return
+
+        client = self._get_client(channel_id)
+        team_id = self._channel_team.get(channel_id, "")
+        if not team_id and self._team_clients:
+            team_id = next(iter(self._team_clients.keys()))
+            self._channel_team[channel_id] = team_id
+
+        history = await client.conversations_history(channel=channel_id, limit=30)
+        messages_by_ts: Dict[str, Dict[str, Any]] = {}
+        roots = history.get("messages", []) if hasattr(history, "get") else []
+        bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+
+        def _remember_bot_thread(message: Dict[str, Any], root_ts: str = "") -> None:
+            """Remember threads where this bot has already participated."""
+            msg_ts = str(message.get("ts", "") or "")
+            msg_user = str(message.get("user", "") or "")
+            bot_profile = message.get("bot_profile") or {}
+            bot_profile_user = str(bot_profile.get("user_id", "") or "")
+            is_own_bot = bool(
+                msg_ts
+                and (
+                    (bot_uid and msg_user == bot_uid)
+                    or (bot_uid and bot_profile_user == bot_uid)
+                )
+            )
+            if not is_own_bot:
+                return
+
+            self._bot_message_ts.add(msg_ts)
+            thread_ts = str(message.get("thread_ts") or root_ts or msg_ts)
+            if thread_ts:
+                self._bot_message_ts.add(thread_ts)
+            if len(self._bot_message_ts) > self._BOT_TS_MAX:
+                excess = len(self._bot_message_ts) - self._BOT_TS_MAX // 2
+                for old_ts in list(self._bot_message_ts)[:excess]:
+                    self._bot_message_ts.discard(old_ts)
+
+        for root in roots:
+            root_ts = str(root.get("ts", "") or "")
+            if root_ts:
+                messages_by_ts[root_ts] = dict(root)
+                _remember_bot_thread(root, root_ts)
+
+            if not root_ts or not root.get("reply_count"):
+                continue
+
+            try:
+                replies = await client.conversations_replies(
+                    channel=channel_id,
+                    ts=root_ts,
+                    limit=50,
+                )
+            except Exception as e:  # pragma: no cover - defensive logging
+                logger.debug("[Slack] Polling fallback could not read replies for %s/%s: %s", channel_id, root_ts, e)
+                continue
+
+            for reply in replies.get("messages", []) if hasattr(replies, "get") else []:
+                reply_ts = str(reply.get("ts", "") or "")
+                if reply_ts:
+                    messages_by_ts[reply_ts] = dict(reply)
+                    _remember_bot_thread(reply, root_ts)
+
+        oldest = max(time.time() - self._slack_poll_lookback(), self._poll_started_at)
+        for ts, event in sorted(messages_by_ts.items(), key=lambda item: float(item[0])):
+            try:
+                ts_value = float(ts)
+            except ValueError:
+                continue
+
+            if ts_value < oldest or ts in self._poll_seen:
+                continue
+
+            self._poll_seen.add(ts)
+            if len(self._poll_seen) > self._POLL_SEEN_MAX:
+                excess = len(self._poll_seen) - self._POLL_SEEN_MAX // 2
+                for old_ts in list(self._poll_seen)[:excess]:
+                    self._poll_seen.discard(old_ts)
+
+            event.setdefault("channel", channel_id)
+            event.setdefault("team", team_id)
+            event.setdefault("team_id", team_id)
+            event.setdefault("channel_type", "group")
+
+            logger.info(
+                "[Slack] Polling fallback dispatching message channel=%s ts=%s thread_ts=%s",
+                channel_id,
+                ts,
+                event.get("thread_ts", ""),
+            )
+            await self._handle_slack_message(event)
 
     def _get_client(self, chat_id: str) -> Any:
         """Return the workspace-specific WebClient for a channel."""
@@ -574,6 +979,9 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            await self._ensure_slack_mention_aliases(chat_id)
+            content = self._apply_slack_mention_aliases(chat_id, content)
+            content = self._sanitize_private_workroom_output(chat_id, content)
             # Convert standard markdown → Slack mrkdwn
             formatted = self.format_message(content)
 
@@ -636,6 +1044,9 @@ class SlackAdapter(BasePlatformAdapter):
         if not self._app:
             return SendResult(success=False, error="Not connected")
         try:
+            await self._ensure_slack_mention_aliases(chat_id)
+            content = self._apply_slack_mention_aliases(chat_id, content)
+            content = self._sanitize_private_workroom_output(chat_id, content)
             formatted = self.format_message(content)
             await self._get_client(chat_id).chat_update(
                 channel=chat_id,
@@ -1105,6 +1516,51 @@ class SlackAdapter(BasePlatformAdapter):
 
     # ----- User identity resolution -----
 
+    async def _resolve_user_profile(self, user_id: str, chat_id: str = "") -> Dict[str, Any]:
+        """Resolve a Slack user ID to selected profile fields, with caching."""
+        if not user_id:
+            return {}
+        cached = self._user_profile_cache.get(user_id)
+        if cached is not None:
+            return cached
+
+        fallback = {"id": user_id, "name": user_id}
+        if not self._app:
+            self._user_profile_cache[user_id] = fallback
+            return fallback
+
+        try:
+            client = self._get_client(chat_id) if chat_id else self._app.client
+            result = await client.users_info(user=user_id)
+            user = result.get("user", {}) if hasattr(result, "get") else {}
+            profile = user.get("profile", {}) if isinstance(user.get("profile"), dict) else {}
+            resolved = {
+                "id": str(user.get("id") or user_id),
+                "name": str(user.get("name") or ""),
+                "real_name": str(user.get("real_name") or ""),
+                "display_name": str(profile.get("display_name") or ""),
+                "display_name_normalized": str(profile.get("display_name_normalized") or ""),
+                "real_name_normalized": str(profile.get("real_name_normalized") or ""),
+                "is_bot": bool(user.get("is_bot")),
+                "deleted": bool(user.get("deleted")),
+            }
+            self._user_profile_cache[user_id] = resolved
+            return resolved
+        except Exception as e:
+            logger.debug("[Slack] users.info failed for %s: %s", user_id, e)
+            self._user_profile_cache[user_id] = fallback
+            return fallback
+
+    @staticmethod
+    def _display_name_from_profile(profile: Dict[str, Any], user_id: str) -> str:
+        return (
+            str(profile.get("display_name") or "")
+            or str(profile.get("real_name") or "")
+            or str(profile.get("real_name_normalized") or "")
+            or str(profile.get("name") or "")
+            or user_id
+        )
+
     async def _resolve_user_name(self, user_id: str, chat_id: str = "") -> str:
         """Resolve a Slack user ID to a display name, with caching."""
         if not user_id:
@@ -1112,28 +1568,10 @@ class SlackAdapter(BasePlatformAdapter):
         if user_id in self._user_name_cache:
             return self._user_name_cache[user_id]
 
-        if not self._app:
-            return user_id
-
-        try:
-            client = self._get_client(chat_id) if chat_id else self._app.client
-            result = await client.users_info(user=user_id)
-            user = result.get("user", {})
-            # Prefer display_name → real_name → user_id
-            profile = user.get("profile", {})
-            name = (
-                profile.get("display_name")
-                or profile.get("real_name")
-                or user.get("real_name")
-                or user.get("name")
-                or user_id
-            )
-            self._user_name_cache[user_id] = name
-            return name
-        except Exception as e:
-            logger.debug("[Slack] users.info failed for %s: %s", user_id, e)
-            self._user_name_cache[user_id] = user_id
-            return user_id
+        profile = await self._resolve_user_profile(user_id, chat_id=chat_id)
+        name = self._display_name_from_profile(profile, user_id)
+        self._user_name_cache[user_id] = name
+        return name
 
     async def send_image_file(
         self,
@@ -1702,6 +2140,13 @@ class SlackAdapter(BasePlatformAdapter):
             elif self._slack_strict_mention() and not is_mentioned:
                 return  # Strict mode: ignore until @-mentioned again
             elif not is_mentioned:
+                if self._starts_with_other_slack_user_mention(routing_text, bot_uid):
+                    logger.info(
+                        "[Slack] Ignoring active-thread message addressed to another user channel=%s ts=%s",
+                        channel_id,
+                        ts,
+                    )
+                    return
                 reply_to_bot_thread = (
                     is_thread_reply and event_thread_ts in self._bot_message_ts
                 )
@@ -1920,6 +2365,29 @@ class SlackAdapter(BasePlatformAdapter):
         _channel_prompt = resolve_channel_prompt(
             self.config.extra, channel_id, None,
         )
+        _audience_prompt = await self._fetch_channel_audience_prompt(
+            channel_id=channel_id,
+            is_dm=is_dm,
+            team_id=team_id,
+        )
+        if _audience_prompt:
+            _channel_prompt = (
+                (_channel_prompt or "").strip()
+                + "\n\n"
+                + _audience_prompt
+            ).strip()
+        _related_prompt = await self._fetch_related_channel_context_prompt(
+            channel_id=channel_id,
+            is_dm=is_dm,
+            team_id=team_id,
+        )
+        if _related_prompt:
+            _channel_prompt = (
+                (_channel_prompt or "").strip()
+                + "\n\n"
+                + _related_prompt
+            ).strip()
+
         _auto_skill = resolve_channel_skills(
             self.config.extra, channel_id, None,
         )
@@ -2301,6 +2769,327 @@ class SlackAdapter(BasePlatformAdapter):
         # (approval state already consumed by atomic pop above)
 
     # ----- Thread context fetching -----
+
+    async def _fetch_channel_audience_prompt(
+        self,
+        channel_id: str,
+        is_dm: bool,
+        team_id: str = "",
+    ) -> str:
+        """Return a short, cached prompt describing current channel members."""
+        if is_dm or not channel_id:
+            return ""
+
+        cache_key = f"{team_id}:{channel_id}"
+        now = time.monotonic()
+        cached = self._channel_audience_cache.get(cache_key)
+        alias_cached = self._auto_mention_alias_cache.get(cache_key)
+        if (
+            cached
+            and (now - cached[0]) < self._CHANNEL_AUDIENCE_TTL
+            and alias_cached
+            and (now - alias_cached[0]) < self._CHANNEL_AUDIENCE_TTL
+        ):
+            return cached[1]
+
+        try:
+            client = self._get_client(channel_id)
+            channel_name = channel_id
+            try:
+                info = await client.conversations_info(channel=channel_id)
+                channel = info.get("channel", {}) if hasattr(info, "get") else {}
+                name = channel.get("name") or channel.get("name_normalized")
+                if name:
+                    channel_name = f"#{name}"
+            except Exception as e:
+                logger.debug("[Slack] conversations.info failed for %s: %s", channel_id, e)
+
+            member_ids: List[str] = []
+            cursor = ""
+            while True:
+                result = await client.conversations_members(
+                    channel=channel_id,
+                    limit=200,
+                    cursor=cursor or None,
+                )
+                member_ids.extend(result.get("members", []) if hasattr(result, "get") else [])
+                metadata = result.get("response_metadata", {}) if hasattr(result, "get") else {}
+                cursor = metadata.get("next_cursor") or ""
+                if not cursor:
+                    break
+
+            bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+            humans: List[str] = []
+            bots: List[str] = []
+            human_profiles: List[Dict[str, Any]] = []
+
+            for member_id in member_ids:
+                profile = await self._resolve_user_profile(member_id, chat_id=channel_id)
+                name = self._display_name_from_profile(profile, member_id)
+                if bot_uid and member_id == bot_uid:
+                    bots.append(f"{name} (bot)")
+                else:
+                    humans.append(name)
+                    human_profiles.append(profile)
+
+            aliases = self._build_slack_mention_aliases_from_profiles(human_profiles)
+            self._auto_mention_alias_cache[cache_key] = (now, aliases)
+            logger.debug(
+                "[Slack] Built %d auto mention alias(es) for channel %s",
+                len(aliases),
+                channel_id,
+            )
+
+            if not humans and not bots:
+                return ""
+
+            lines = [
+                "[Slack channel context]",
+                f"Channel: {channel_name} ({channel_id})",
+            ]
+            if humans:
+                lines.append("Human members currently visible to the bot: " + ", ".join(humans) + ".")
+            if bots:
+                lines.append("Bot members: " + ", ".join(bots) + ".")
+            lines.append("Do not assume people outside this roster are present in the Slack channel.")
+            lines.append("[End Slack channel context]")
+
+            prompt = "\n".join(lines)
+            self._channel_audience_cache[cache_key] = (now, prompt)
+            return prompt
+
+        except Exception as e:
+            logger.warning("[Slack] Failed to fetch channel audience for %s: %s", channel_id, e)
+            return ""
+
+    @staticmethod
+    def _parse_slack_channel_id_list(raw: Any) -> List[str]:
+        """Parse a Slack channel list from YAML or env config."""
+        if raw is None:
+            return []
+        if isinstance(raw, (list, tuple, set)):
+            return [str(c).strip() for c in raw if str(c).strip()]
+        return [c.strip() for c in re.split(r"[\s,]+", str(raw)) if c.strip()]
+
+    def _slack_context_channels(self, channel_id: str) -> List[str]:
+        """Return read-only Slack channels whose recent messages should inform this channel."""
+        configured = self.config.extra.get("context_channels")
+        if isinstance(configured, dict):
+            raw = configured.get(channel_id)
+            if raw is None:
+                raw = configured.get("*")
+            return self._parse_slack_channel_id_list(raw)
+        if configured:
+            return self._parse_slack_channel_id_list(configured)
+
+        # Env fallback format:
+        #   SLACK_CONTEXT_CHANNELS=C0TARGET=C1SOURCE,C2SOURCE;*=C3SOURCE
+        # If no mapping syntax is present, the list applies to every channel.
+        raw_env = os.getenv("SLACK_CONTEXT_CHANNELS", "").strip()
+        if not raw_env:
+            return []
+        if "=" not in raw_env:
+            return self._parse_slack_channel_id_list(raw_env)
+        for entry in raw_env.split(";"):
+            if "=" not in entry:
+                continue
+            target, sources = entry.split("=", 1)
+            if target.strip() in {channel_id, "*"}:
+                return self._parse_slack_channel_id_list(sources)
+        return []
+
+    @staticmethod
+    def _slack_timestamp_label(ts: str) -> str:
+        try:
+            return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
+        except (TypeError, ValueError):
+            return ts
+
+    async def _normalize_related_slack_text(self, text: str, channel_id: str) -> str:
+        """Make Slack entity text readable enough for an ephemeral context prompt."""
+        if not text:
+            return ""
+
+        for user_id in set(re.findall(r"<@([A-Z0-9]+)>", text)):
+            name = await self._resolve_user_name(user_id, chat_id=channel_id)
+            text = text.replace(f"<@{user_id}>", f"@{name}")
+
+        text = re.sub(r"<#([A-Z0-9]+)\|([^>]+)>", r"#\2", text)
+        text = re.sub(r"<#([A-Z0-9]+)>", r"#\1", text)
+        text = re.sub(r"<(https?://[^>|]+)\|([^>]+)>", r"\2 (\1)", text)
+        text = re.sub(r"<(https?://[^>]+)>", r"\1", text)
+        text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    async def _related_slack_message_text(
+        self,
+        message: Dict[str, Any],
+        channel_id: str,
+        bot_uid: Optional[str],
+    ) -> str:
+        text = str(message.get("text") or "").strip()
+
+        blocks = message.get("blocks")
+        if blocks:
+            blocks_text = _extract_text_from_slack_blocks(blocks).strip()
+            if blocks_text and blocks_text not in text:
+                text = (text + "\n" + blocks_text).strip()
+
+        if bot_uid:
+            text = text.replace(f"<@{bot_uid}>", "").strip()
+
+        text = await self._normalize_related_slack_text(text, channel_id)
+        if len(text) > 500:
+            text = text[:497].rstrip() + "..."
+        return text
+
+    async def _fetch_related_channel_context_prompt(
+        self,
+        channel_id: str,
+        is_dm: bool,
+        team_id: str = "",
+    ) -> str:
+        """Return recent messages from configured related channels as read-only context."""
+        if is_dm or not channel_id:
+            return ""
+
+        source_channel_ids = [
+            source
+            for source in self._slack_context_channels(channel_id)
+            if source and source != channel_id
+        ]
+        if not source_channel_ids:
+            return ""
+
+        cache_key = f"{team_id}:{channel_id}:{','.join(source_channel_ids)}"
+        now = time.monotonic()
+        cached = self._related_channel_context_cache.get(cache_key)
+        if cached and (now - cached[0]) < self._RELATED_CHANNEL_CONTEXT_TTL:
+            return cached[1]
+
+        client = self._get_client(channel_id)
+        bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+        sections: List[str] = []
+
+        for source_channel_id in source_channel_ids[:5]:
+            if team_id:
+                self._channel_team[source_channel_id] = team_id
+
+            channel_label = source_channel_id
+            try:
+                info = await client.conversations_info(channel=source_channel_id)
+                channel = info.get("channel", {}) if hasattr(info, "get") else {}
+                name = channel.get("name") or channel.get("name_normalized")
+                if name:
+                    channel_label = f"#{name}"
+            except Exception as exc:
+                logger.debug("[Slack] conversations.info failed for related channel %s: %s", source_channel_id, exc)
+
+            try:
+                history = await client.conversations_history(channel=source_channel_id, limit=8)
+            except Exception as exc:
+                logger.warning("[Slack] Failed to fetch related channel context for %s: %s", source_channel_id, exc)
+                continue
+
+            root_messages = history.get("messages", []) if hasattr(history, "get") else []
+            if not root_messages:
+                continue
+
+            expanded_messages: List[Tuple[str, Dict[str, Any]]] = []
+            for root in reversed(root_messages):
+                root_ts = str(root.get("ts", "") or "")
+                if root_ts:
+                    expanded_messages.append((root_ts, root))
+
+                if not root_ts or not root.get("reply_count"):
+                    continue
+
+                try:
+                    replies = await client.conversations_replies(
+                        channel=source_channel_id,
+                        ts=root_ts,
+                        limit=20,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "[Slack] Could not fetch related thread replies for %s/%s: %s",
+                        source_channel_id,
+                        root_ts,
+                        exc,
+                    )
+                    continue
+
+                reply_messages = replies.get("messages", []) if hasattr(replies, "get") else []
+                reply_messages = [
+                    reply
+                    for reply in reply_messages
+                    if str(reply.get("ts", "") or "") != root_ts
+                ][-5:]
+                for reply in reply_messages:
+                    reply_ts = str(reply.get("ts", "") or "")
+                    if reply_ts:
+                        expanded_messages.append((reply_ts, reply))
+
+            rows: List[str] = []
+            seen_ts: set = set()
+            for msg_ts, msg in sorted(expanded_messages, key=lambda item: float(item[0])):
+                if msg_ts in seen_ts:
+                    continue
+                seen_ts.add(msg_ts)
+
+                if msg.get("subtype") in {"message_deleted", "message_changed"}:
+                    continue
+
+                msg_user = str(msg.get("user", "") or "")
+                bot_profile = msg.get("bot_profile") or {}
+                bot_profile_user = str(bot_profile.get("user_id", "") or "")
+                if bot_uid and (msg_user == bot_uid or bot_profile_user == bot_uid):
+                    continue
+
+                msg_text = await self._related_slack_message_text(
+                    msg,
+                    channel_id=source_channel_id,
+                    bot_uid=bot_uid,
+                )
+                if not msg_text:
+                    continue
+
+                if msg_user:
+                    display_name = await self._resolve_user_name(msg_user, chat_id=source_channel_id)
+                else:
+                    display_name = str(msg.get("username") or "Slack app")
+
+                rows.append(
+                    f"- {self._slack_timestamp_label(msg_ts)}, {display_name}: {msg_text}"
+                )
+                if len(rows) >= 16:
+                    break
+
+            if rows:
+                sections.append(
+                    f"Recent visible messages from {channel_label} ({source_channel_id}), oldest to newest:\n"
+                    + "\n".join(rows)
+                )
+
+        if not sections:
+            self._related_channel_context_cache[cache_key] = (now, "")
+            return ""
+
+        prompt = (
+            "[Related Slack channel context]\n"
+            "Use this read-only context when answering in the current Slack channel. "
+            "For board meeting scheduling or operational status, prefer the newest relevant "
+            "message from these related channels over older assumptions. Do not explain how "
+            "this context was gathered.\n\n"
+            + "\n\n".join(sections)
+            + "\n[End related Slack channel context]"
+        )
+        if len(prompt) > 6000:
+            prompt = prompt[:5997].rstrip() + "..."
+
+        self._related_channel_context_cache[cache_key] = (now, prompt)
+        return prompt
 
     async def _fetch_thread_context(
         self, channel_id: str, thread_ts: str, current_ts: str,

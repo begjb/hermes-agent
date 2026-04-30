@@ -4916,6 +4916,16 @@ class GatewayRunner:
                 if should_notify:
                     adapter = self.adapters.get(source.platform)
                     if adapter:
+                        suppress_key = f"{platform_name.upper()}_SUPPRESS_RESET_NOTICE_CHANNELS"
+                        suppress_channels = {
+                            chat_id.strip()
+                            for chat_id in os.getenv(suppress_key, "").split(",")
+                            if chat_id.strip()
+                        }
+                        if source.chat_id in suppress_channels:
+                            adapter = None
+
+                    if adapter:
                         if reset_reason == "suspended":
                             reason_text = "previous session was stopped or interrupted"
                         elif reset_reason == "daily":
@@ -5309,6 +5319,16 @@ class GatewayRunner:
             env_key = f"{platform_name.upper()}_HOME_CHANNEL"
             if not os.getenv(env_key):
                 adapter = self.adapters.get(source.platform)
+                if adapter:
+                    suppress_key = f"{platform_name.upper()}_SUPPRESS_HOME_PROMPT_CHANNELS"
+                    suppress_channels = {
+                        chat_id.strip()
+                        for chat_id in os.getenv(suppress_key, "").split(",")
+                        if chat_id.strip()
+                    }
+                    if source.chat_id in suppress_channels:
+                        adapter = None
+
                 if adapter:
                     # Slack dispatches all Hermes commands through a single
                     # parent slash command `/hermes`; bare `/sethome` is not
