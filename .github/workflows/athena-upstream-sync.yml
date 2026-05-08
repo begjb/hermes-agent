@@ -1,0 +1,223 @@
+name: Athena Upstream Sync
+
+run-name: Sync upstream Hermes into Athena fork
+
+'on':
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: Upstream branch or ref to merge from NousResearch/hermes-agent.
+        required: true
+        default: main
+        type: string
+  schedule:
+    # Weekday morning UTC. The workflow opens a PR; it does not deploy.
+    - cron: '17 6 * * 1-5'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: athena-hermes-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream into Athena fork
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out Athena fork
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ secrets.ATHENA_HERMES_SYNC_TOKEN || github.token }}
+
+      - name: Install system dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
+
+      - name: Configure git
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "athena-hermes-sync"
+          git config user.email "athena-hermes-sync@users.noreply.github.com"
+
+      - name: Fetch upstream
+        id: refs
+        shell: bash
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
+        run: |
+          set -euo pipefail
+          case "$UPSTREAM_REF" in
+            ""|-*|*..*|*~*|*^*|*:*)
+              echo "::error::Unsafe upstream ref: $UPSTREAM_REF"
+              exit 1
+              ;;
+          esac
+
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch origin +refs/heads/main:refs/remotes/origin/main --quiet
+          git fetch upstream "+refs/heads/$UPSTREAM_REF:refs/remotes/upstream/$UPSTREAM_REF" --quiet
+
+          upstream_sha="$(git rev-parse "upstream/$UPSTREAM_REF")"
+          upstream_short="$(git rev-parse --short=10 "$upstream_sha")"
+          base_sha="$(git rev-parse origin/main)"
+          branch="athena/upstream-sync-$upstream_short"
+
+          {
+            printf 'upstream_ref=%s\n' "$UPSTREAM_REF"
+            printf 'upstream_sha=%s\n' "$upstream_sha"
+            printf 'upstream_short=%s\n' "$upstream_short"
+            printf 'base_sha=%s\n' "$base_sha"
+            printf 'branch=%s\n' "$branch"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Merge upstream into sync branch
+        shell: bash
+        env:
+          UPSTREAM_REF: ${{ steps.refs.outputs.upstream_ref }}
+          BRANCH: ${{ steps.refs.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git checkout -B "$BRANCH" origin/main
+
+          if git merge-base --is-ancestor "upstream/$UPSTREAM_REF" HEAD; then
+            echo "Athena fork already contains upstream/$UPSTREAM_REF."
+            echo "already_current=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          if ! git merge --no-edit "upstream/$UPSTREAM_REF"; then
+            echo "::error::Upstream merge conflicted. Resolve locally, preserve Athena Slack behavior, then push the integration branch manually."
+            git status --short
+            exit 1
+          fi
+
+      - name: Set up Python 3.12
+        if: env.already_current != 'true'
+        shell: bash
+        run: uv python install 3.12
+
+      - name: Install focused test dependencies
+        if: env.already_current != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv venv .venv --python 3.12
+          source .venv/bin/activate
+          uv pip install -e ".[all,dev]"
+
+      - name: Run Athena Hermes focused tests
+        if: env.already_current != 'true'
+        shell: bash
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          python -m py_compile gateway/platforms/slack.py tools/send_message_tool.py
+          python -m pytest -o addopts='' \
+            tests/tools/test_send_message_tool.py::TestSendMessageTool::test_delete_action_deletes_directly_by_default \
+            tests/tools/test_send_message_tool.py::TestSendMessageTool::test_delete_action_requests_slack_confirmation_when_confirm_true \
+            tests/tools/test_send_message_tool.py::TestSendMessageTool::test_delete_action_requires_message_id \
+            tests/tools/test_send_message_tool.py::TestDeleteSlackDirect \
+            tests/gateway/test_slack_approval_buttons.py::TestSlackSlashConfirm::test_can_hide_always_approve_button \
+            -q
+
+      - name: Run Hermes test suite
+        if: env.already_current != 'true'
+        shell: bash
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto
+
+      - name: Push sync branch
+        if: env.already_current != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.ATHENA_HERMES_SYNC_TOKEN || github.token }}
+          BRANCH: ${{ steps.refs.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git push --force-with-lease origin "HEAD:$BRANCH"
+
+      - name: Open or update PR
+        if: env.already_current != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.ATHENA_HERMES_SYNC_TOKEN || github.token }}
+          BRANCH: ${{ steps.refs.outputs.branch }}
+          BASE_SHA: ${{ steps.refs.outputs.base_sha }}
+          UPSTREAM_REF: ${{ steps.refs.outputs.upstream_ref }}
+          UPSTREAM_SHA: ${{ steps.refs.outputs.upstream_sha }}
+          UPSTREAM_SHORT: ${{ steps.refs.outputs.upstream_short }}
+        run: |
+          set -euo pipefail
+          body_file="$RUNNER_TEMP/athena-upstream-sync-pr.md"
+          cat > "$body_file" <<EOF
+          ## Summary
+
+          Automated upstream sync from \`NousResearch/hermes-agent:$UPSTREAM_REF\`.
+
+          - Athena fork base: \`$BASE_SHA\`
+          - Upstream target: \`$UPSTREAM_SHA\`
+          - Sync branch: \`$BRANCH\`
+
+          ## Required checks before merge
+
+          - Preserve Board CoS Slack polling fallback.
+          - Preserve Slack mention/surface policy behavior.
+          - Preserve Slack message edit/delete support.
+          - Preserve per-message human confirmation for agent-initiated deletes.
+          - Let the sync workflow and any repository PR checks complete.
+
+          ## Automation result
+
+          Focused Athena Hermes Slack tests and the Hermes test suite passed in this workflow before opening/updating the PR.
+          EOF
+
+          existing_pr="$(gh pr list --head "$BRANCH" --base main --json number --jq '.[0].number // empty')"
+          if [ -n "$existing_pr" ]; then
+            gh pr edit "$existing_pr" \
+              --title "Sync Hermes upstream $UPSTREAM_SHORT into Athena fork" \
+              --body-file "$body_file"
+            gh pr view "$existing_pr" --json url --jq '.url'
+          else
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "Sync Hermes upstream $UPSTREAM_SHORT into Athena fork" \
+              --body-file "$body_file"
+          fi
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Athena Hermes upstream sync"
+            echo
+            echo "- Upstream ref: \`${{ steps.refs.outputs.upstream_ref || 'main' }}\`"
+            echo "- Upstream SHA: \`${{ steps.refs.outputs.upstream_sha || 'not resolved' }}\`"
+            echo "- Branch: \`${{ steps.refs.outputs.branch || 'not created' }}\`"
+            echo "- Already current: \`${already_current:-false}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
