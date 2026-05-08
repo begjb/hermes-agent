@@ -1752,7 +1752,7 @@ class SlackAdapter(BasePlatformAdapter):
             resolved = {
                 "id": str(user.get("id") or user_id),
                 "name": str(user.get("name") or ""),
-                "real_name": str(user.get("real_name") or ""),
+                "real_name": str(user.get("real_name") or profile.get("real_name") or ""),
                 "display_name": str(profile.get("display_name") or ""),
                 "display_name_normalized": str(profile.get("display_name_normalized") or ""),
                 "real_name_normalized": str(profile.get("real_name_normalized") or ""),

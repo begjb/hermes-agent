@@ -138,8 +138,10 @@ jobs:
             tests/gateway/test_slack_approval_buttons.py::TestSlackSlashConfirm::test_can_hide_always_approve_button \
             -q
 
-      - name: Run Hermes test suite
+      - name: Run Hermes test suite (advisory upstream baseline)
+        id: full_tests
         if: env.already_current != 'true'
+        continue-on-error: true
         shell: bash
         env:
           OPENROUTER_API_KEY: ""
@@ -192,7 +194,9 @@ jobs:
 
           ## Automation result
 
-          Focused Athena Hermes Slack tests and the Hermes test suite passed in this workflow before opening/updating the PR.
+          Focused Athena Hermes Slack tests passed in this workflow before opening/updating the PR.
+
+          The full upstream Hermes test suite is run as advisory signal only, because upstream `main` is sometimes merged while that suite is red. Treat any full-suite failure as inherited upstream baseline unless it is a new Athena-patch regression.
           EOF
 
           existing_pr="$(gh pr list --head "$BRANCH" --base main --json number --jq '.[0].number // empty')"
@@ -220,4 +224,5 @@ jobs:
             echo "- Upstream SHA: \`${{ steps.refs.outputs.upstream_sha || 'not resolved' }}\`"
             echo "- Branch: \`${{ steps.refs.outputs.branch || 'not created' }}\`"
             echo "- Already current: \`${already_current:-false}\`"
+            echo "- Full upstream test suite outcome: \`${{ steps.full_tests.outcome || 'not run' }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
