@@ -145,6 +145,31 @@ class TestSlackExecApproval:
         assert len(section_text) < 5000
 
 
+class TestSlackSlashConfirm:
+    """Test generic Slack confirmation prompts."""
+
+    @pytest.mark.asyncio
+    async def test_can_hide_always_approve_button(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
+
+        result = await adapter.send_slash_confirm(
+            chat_id="C1",
+            title="Confirm Slack Message Deletion",
+            message="Delete message 1234.5678?",
+            session_key="session-key",
+            confirm_id="confirm-id",
+            metadata={"allow_always": False},
+        )
+
+        assert result.success is True
+        kwargs = mock_client.chat_postMessage.call_args[1]
+        elements = kwargs["blocks"][1]["elements"]
+        action_ids = [element["action_id"] for element in elements]
+        assert action_ids == ["hermes_confirm_once", "hermes_confirm_cancel"]
+
+
 # ===========================================================================
 # _handle_approval_action — button click handler
 # ===========================================================================

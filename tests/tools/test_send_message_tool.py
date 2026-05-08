@@ -23,6 +23,7 @@ def _reset_signal_scheduler():
 from gateway.config import Platform
 from tools.send_message_tool import (
     _derive_forum_thread_name,
+    _delete_slack,
     _parse_target_ref,
     _send_discord,
     _send_matrix_via_adapter,
@@ -78,6 +79,88 @@ def _ensure_slack_mock(monkeypatch):
 
 
 class TestSendMessageTool:
+    def test_delete_action_deletes_directly_by_default(self):
+        slack_cfg = SimpleNamespace(enabled=True, token="tok", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.SLACK: slack_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._delete_message_on_platform", new=AsyncMock(return_value={
+                 "success": True,
+                 "message_id": "1778159486.033869",
+             })) as delete_mock:
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "delete",
+                        "target": "slack:C0B0QV5434G",
+                        "message_id": "1778159486.033869",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        delete_mock.assert_awaited_once_with(
+            Platform.SLACK,
+            slack_cfg,
+            "C0B0QV5434G",
+            "1778159486.033869",
+        )
+
+    def test_delete_action_requests_slack_confirmation_when_confirm_true(self):
+        slack_cfg = SimpleNamespace(enabled=True, token="tok", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.SLACK: slack_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._request_delete_confirmation", new=AsyncMock(return_value={
+                 "success": True,
+                 "confirmation_requested": True,
+                 "message_id": "1778159486.033869",
+             })) as confirm_mock:
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "delete",
+                        "target": "slack:C0B0QV5434G",
+                        "message_id": "1778159486.033869",
+                        "reason": "duplicate agenda post",
+                        "confirm": True,
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        assert result["confirmation_requested"] is True
+        confirm_mock.assert_awaited_once_with(
+            Platform.SLACK,
+            slack_cfg,
+            "C0B0QV5434G",
+            "1778159486.033869",
+            reason="duplicate agenda post",
+            thread_id=None,
+        )
+
+    def test_delete_action_requires_message_id(self):
+        result = json.loads(
+            send_message_tool(
+                {
+                    "action": "delete",
+                    "target": "slack:C0B0QV5434G",
+                }
+            )
+        )
+
+        assert "message_id" in result["error"]
+
     def test_cron_duplicate_target_is_skipped_and_explained(self):
         home = SimpleNamespace(chat_id="-1001")
         config, _telegram_cfg = _make_config()
@@ -892,6 +975,49 @@ class TestParseTargetRefSlack:
     def test_slack_id_not_explicit_for_other_platforms(self):
         assert _parse_target_ref("discord", "C0B0QV5434G")[2] is False
         assert _parse_target_ref("telegram", "C0B0QV5434G")[2] is False
+
+
+class TestDeleteSlackDirect:
+    """Direct Slack Web API delete fallback uses chat.delete."""
+
+    @staticmethod
+    def _build_mock(response_data):
+        mock_resp = MagicMock()
+        mock_resp.json = AsyncMock(return_value=response_data)
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=None)
+
+        mock_session = MagicMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=None)
+        mock_session.post = MagicMock(return_value=mock_resp)
+        return mock_session
+
+    def test_success_uses_chat_delete_payload(self):
+        mock_session = self._build_mock({"ok": True})
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            result = asyncio.run(
+                _delete_slack("tok", "C0B0QV5434G", "1778159486.033869")
+            )
+
+        assert result["success"] is True
+        assert result["message_id"] == "1778159486.033869"
+        call = mock_session.post.call_args
+        assert call.args[0] == "https://slack.com/api/chat.delete"
+        assert call.kwargs["json"] == {
+            "channel": "C0B0QV5434G",
+            "ts": "1778159486.033869",
+        }
+
+    def test_api_error_is_returned(self):
+        mock_session = self._build_mock({"ok": False, "error": "cant_delete_message"})
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            result = asyncio.run(
+                _delete_slack("tok", "C0B0QV5434G", "1778159486.033869")
+            )
+
+        assert "error" in result
+        assert "cant_delete_message" in result["error"]
 
 
 class TestSendDiscordThreadId:

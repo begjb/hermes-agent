@@ -1064,6 +1064,31 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return SendResult(success=False, error=str(e))
 
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a previously sent Slack message.
+
+        Slack's Web API only permits bot tokens to delete messages posted by
+        the same bot identity. Failures are non-fatal; callers can surface the
+        Slack error and leave the message in place.
+        """
+        if not self._app:
+            return False
+        try:
+            await self._get_client(chat_id).chat_delete(
+                channel=chat_id,
+                ts=message_id,
+            )
+            return True
+        except Exception as e:  # pragma: no cover - defensive logging
+            logger.debug(
+                "[Slack] Failed to delete message %s in channel %s: %s",
+                message_id,
+                chat_id,
+                e,
+                exc_info=True,
+            )
+            return False
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Show a typing/status indicator using assistant.threads.setStatus.
 
@@ -2524,9 +2549,40 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             body = message[:2900] + "..." if len(message) > 2900 else message
             thread_ts = self._resolve_thread_ts(None, metadata)
+            allow_always = True
+            if metadata and metadata.get("allow_always") is False:
+                allow_always = False
             # Encode session_key and confirm_id into the button value so the
             # callback handler can resolve without extra bookkeeping.
             value = f"{session_key}|{confirm_id}"
+
+            elements = [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Approve Once"},
+                    "style": "primary",
+                    "action_id": "hermes_confirm_once",
+                    "value": value,
+                },
+            ]
+            if allow_always:
+                elements.append(
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Always Approve"},
+                        "action_id": "hermes_confirm_always",
+                        "value": value,
+                    }
+                )
+            elements.append(
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Cancel"},
+                    "style": "danger",
+                    "action_id": "hermes_confirm_cancel",
+                    "value": value,
+                }
+            )
 
             blocks = [
                 {
@@ -2538,28 +2594,7 @@ class SlackAdapter(BasePlatformAdapter):
                 },
                 {
                     "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Approve Once"},
-                            "style": "primary",
-                            "action_id": "hermes_confirm_once",
-                            "value": value,
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Always Approve"},
-                            "action_id": "hermes_confirm_always",
-                            "value": value,
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Cancel"},
-                            "style": "danger",
-                            "action_id": "hermes_confirm_cancel",
-                            "value": value,
-                        },
-                    ],
+                    "elements": elements,
                 },
             ]
 

@@ -10,9 +10,11 @@ import json
 import logging
 import os
 import re
-from typing import Dict, Optional
 import ssl
 import time
+import uuid
+from email.utils import formatdate
+from typing import Dict, Optional
 
 from agent.redact import redact_sensitive_text
 
@@ -127,8 +129,8 @@ SEND_MESSAGE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["send", "list"],
-                "description": "Action to perform. 'send' (default) sends a message. 'list' returns all available channels/contacts across connected platforms."
+                "enum": ["send", "list", "edit", "delete"],
+                "description": "Action to perform. 'send' (default) sends a message. 'list' returns all available channels/contacts across connected platforms. 'edit' updates a previously sent message when the platform supports edits. 'delete' deletes a bot-owned Slack message; set confirm=true when the agent is proposing deletion without an explicit human request."
             },
             "target": {
                 "type": "string",
@@ -136,7 +138,19 @@ SEND_MESSAGE_SCHEMA = {
             },
             "message": {
                 "type": "string",
-                "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/hermes/cache/img_xxx.jpg') in the message — the platform will deliver it as a native media attachment."
+                "description": "The message text to send. For Slack formatting, write standard Markdown such as **bold**; do not pre-convert bold to Slack single-asterisk mrkdwn. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/hermes/cache/img_xxx.jpg') in the message — the platform will deliver it as a native media attachment."
+            },
+            "message_id": {
+                "type": "string",
+                "description": "Message id or timestamp to edit/delete when action='edit' or action='delete'. For Slack, use the message ts returned by a prior send."
+            },
+            "reason": {
+                "type": "string",
+                "description": "Short reason shown in the Slack confirmation prompt when action='delete' and confirm=true."
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": "For action='delete': when true, ask EAs/operators to confirm in Slack before deleting. Use this for agent-initiated cleanup. When a human explicitly asks to delete a specific message, omit this or set false."
             }
         },
         "required": []
@@ -150,6 +164,15 @@ def send_message_tool(args, **kw):
 
     if action == "list":
         return _handle_list()
+
+    if action == "edit":
+        return _handle_edit(args)
+
+    if action == "delete":
+        return _handle_delete(args)
+
+    if action != "send":
+        return tool_error(f"Unknown action: {action}")
 
     return _handle_send(args)
 
@@ -307,6 +330,192 @@ def _handle_send(args):
         return json.dumps(_error(f"Send failed: {e}"))
 
 
+def _handle_edit(args):
+    """Edit a previously sent platform message."""
+    target = args.get("target", "")
+    message = args.get("message", "")
+    message_id = str(args.get("message_id", "")).strip()
+    if not target or not message or not message_id:
+        return tool_error("All of 'target', 'message_id', and 'message' are required when action='edit'")
+
+    parts = target.split(":", 1)
+    platform_name = parts[0].strip().lower()
+    target_ref = parts[1].strip() if len(parts) > 1 else None
+    chat_id = None
+    thread_id = None
+
+    if target_ref:
+        chat_id, thread_id, is_explicit = _parse_target_ref(platform_name, target_ref)
+    else:
+        is_explicit = False
+
+    if target_ref and not is_explicit:
+        try:
+            from gateway.channel_directory import resolve_channel_name
+            resolved = resolve_channel_name(platform_name, target_ref)
+            if resolved:
+                chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
+            else:
+                return json.dumps({
+                    "error": f"Could not resolve '{target_ref}' on {platform_name}. "
+                    f"Use send_message(action='list') to see available targets."
+                })
+        except Exception:
+            return json.dumps({
+                "error": f"Could not resolve '{target_ref}' on {platform_name}. "
+                f"Try using a numeric channel ID instead."
+            })
+
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return tool_error("Interrupted")
+
+    try:
+        from gateway.config import load_gateway_config, Platform
+        config = load_gateway_config()
+    except Exception as e:
+        return json.dumps(_error(f"Failed to load gateway config: {e}"))
+
+    try:
+        platform = Platform(platform_name)
+    except (ValueError, KeyError):
+        return tool_error(f"Unknown platform: {platform_name}")
+
+    pconfig = config.platforms.get(platform)
+    if not pconfig or not pconfig.enabled:
+        return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
+
+    if not chat_id:
+        home = config.get_home_channel(platform)
+        if home:
+            chat_id = home.chat_id
+        else:
+            return json.dumps({
+                "error": f"No channel specified for {platform_name}. "
+                f"Use action='edit' with a target like '{platform_name}:CHANNEL_ID' and the original message_id."
+            })
+
+    from gateway.platforms.base import BasePlatformAdapter
+    media_files, cleaned_message = BasePlatformAdapter.extract_media(message)
+    if media_files:
+        return tool_error("MEDIA attachments are not supported when action='edit'; edit the text message only")
+
+    try:
+        from model_tools import _run_async
+        result = _run_async(
+            _edit_message_on_platform(
+                platform,
+                pconfig,
+                chat_id,
+                message_id,
+                cleaned_message,
+            )
+        )
+        if isinstance(result, dict) and "error" in result:
+            result["error"] = _sanitize_error_text(result["error"])
+        return json.dumps(result)
+    except Exception as e:
+        return json.dumps(_error(f"Edit failed: {e}"))
+
+
+def _handle_delete(args):
+    """Delete a Slack message directly, or ask in Slack first when confirm=true."""
+    target = args.get("target", "")
+    message_id = str(args.get("message_id", "")).strip()
+    reason = str(args.get("reason", "") or "").strip()
+    confirm = _read_bool_arg(args.get("confirm"), default=False)
+    if not target or not message_id:
+        return tool_error("Both 'target' and 'message_id' are required when action='delete'")
+
+    parts = target.split(":", 1)
+    platform_name = parts[0].strip().lower()
+    target_ref = parts[1].strip() if len(parts) > 1 else None
+    chat_id = None
+    thread_id = None
+
+    if target_ref:
+        chat_id, thread_id, is_explicit = _parse_target_ref(platform_name, target_ref)
+    else:
+        is_explicit = False
+
+    if target_ref and not is_explicit:
+        try:
+            from gateway.channel_directory import resolve_channel_name
+            resolved = resolve_channel_name(platform_name, target_ref)
+            if resolved:
+                chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
+            else:
+                return json.dumps({
+                    "error": f"Could not resolve '{target_ref}' on {platform_name}. "
+                    f"Use send_message(action='list') to see available targets."
+                })
+        except Exception:
+            return json.dumps({
+                "error": f"Could not resolve '{target_ref}' on {platform_name}. "
+                f"Try using a numeric channel ID instead."
+            })
+
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return tool_error("Interrupted")
+
+    try:
+        from gateway.config import load_gateway_config, Platform
+        config = load_gateway_config()
+    except Exception as e:
+        return json.dumps(_error(f"Failed to load gateway config: {e}"))
+
+    try:
+        platform = Platform(platform_name)
+    except (ValueError, KeyError):
+        return tool_error(f"Unknown platform: {platform_name}")
+
+    if platform != Platform.SLACK:
+        return tool_error("action='delete' currently supports Slack only.")
+
+    pconfig = config.platforms.get(platform)
+    if not pconfig or not pconfig.enabled:
+        return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
+
+    if not chat_id:
+        home = config.get_home_channel(platform)
+        if home:
+            chat_id = home.chat_id
+        else:
+            return json.dumps({
+                "error": f"No channel specified for {platform_name}. "
+                f"Use action='delete' with a target like '{platform_name}:CHANNEL_ID' and the original message_id."
+            })
+
+    try:
+        from model_tools import _run_async
+        if confirm:
+            result = _run_async(
+                _request_delete_confirmation(
+                    platform,
+                    pconfig,
+                    chat_id,
+                    message_id,
+                    reason=reason,
+                    thread_id=thread_id,
+                )
+            )
+        else:
+            result = _run_async(
+                _delete_message_on_platform(
+                    platform,
+                    pconfig,
+                    chat_id,
+                    message_id,
+                )
+            )
+        if isinstance(result, dict) and "error" in result:
+            result["error"] = _sanitize_error_text(result["error"])
+        return json.dumps(result)
+    except Exception as e:
+        return json.dumps(_error(f"Delete failed: {e}"))
+
+
 def _parse_target_ref(platform_name: str, target_ref: str):
     """Parse a tool target into chat_id/thread_id and whether it is explicit."""
     if platform_name == "telegram":
@@ -348,6 +557,20 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     if platform_name == "matrix" and (target_ref.startswith("!") or target_ref.startswith("@")):
         return target_ref, None, True
     return None, None, False
+
+
+def _read_bool_arg(value, *, default=False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(value)
 
 
 def _describe_media_for_mirror(media_files):
@@ -436,6 +659,172 @@ async def _send_via_adapter(platform, pconfig, chat_id, chunk):
     return {"error": f"No live adapter for platform '{platform.value}'. Is the gateway running with this platform connected?"}
 
 
+def _format_slack_message(message: str) -> str:
+    """Format generic markdown into Slack mrkdwn for direct Web API calls."""
+    try:
+        from gateway.platforms.slack import SlackAdapter
+        slack_adapter = SlackAdapter.__new__(SlackAdapter)
+        return slack_adapter.format_message(message)
+    except Exception:
+        logger.debug("Failed to apply Slack mrkdwn formatting", exc_info=True)
+        return message
+
+
+async def _edit_via_adapter(platform, pconfig, chat_id, message_id, message):
+    """Edit a message through a live gateway adapter when available."""
+    adapter = None
+    try:
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+        if runner:
+            adapter = runner.adapters.get(platform)
+            if adapter and hasattr(adapter, "edit_message"):
+                result = await adapter.edit_message(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    content=message,
+                    finalize=True,
+                )
+                if result.success:
+                    return {"success": True, "platform": platform.value, "chat_id": chat_id, "message_id": message_id}
+                return {"error": f"Adapter edit failed: {result.error}"}
+    except TypeError:
+        if adapter and hasattr(adapter, "edit_message"):
+            try:
+                result = await adapter.edit_message(chat_id, message_id, message)
+                if result.success:
+                    return {"success": True, "platform": platform.value, "chat_id": chat_id, "message_id": message_id}
+                return {"error": f"Adapter edit failed: {result.error}"}
+            except Exception as e:
+                return {"error": f"Adapter edit failed: {e}"}
+        return {"error": f"No live edit adapter for platform '{platform.value}'. Is the gateway running with this platform connected?"}
+    except Exception as e:
+        return {"error": f"Adapter edit failed: {e}"}
+    return {"error": f"No live edit adapter for platform '{platform.value}'. Is the gateway running with this platform connected?"}
+
+
+async def _edit_message_on_platform(platform, pconfig, chat_id, message_id, message):
+    """Route message edits to the platform-specific implementation."""
+    from gateway.config import Platform
+
+    if platform == Platform.SLACK:
+        result = await _edit_via_adapter(platform, pconfig, chat_id, message_id, message)
+        if isinstance(result, dict) and result.get("error"):
+            logger.debug(
+                "Live Slack adapter edit unavailable; falling back to direct Web API: %s",
+                result.get("error"),
+            )
+            result = await _edit_slack(pconfig.token, chat_id, message_id, message)
+        return result
+
+    return await _edit_via_adapter(platform, pconfig, chat_id, message_id, message)
+
+
+async def _delete_via_adapter(platform, pconfig, chat_id, message_id):
+    """Delete a message through a live gateway adapter when available."""
+    try:
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+        if runner:
+            adapter = runner.adapters.get(platform)
+            if adapter and hasattr(adapter, "delete_message"):
+                deleted = await adapter.delete_message(chat_id=chat_id, message_id=message_id)
+                if deleted:
+                    return {"success": True, "platform": platform.value, "chat_id": chat_id, "message_id": message_id}
+                return {"error": f"Adapter delete failed or is not supported for platform '{platform.value}'."}
+    except Exception as e:
+        return {"error": f"Adapter delete failed: {e}"}
+    return {"error": f"No live delete adapter for platform '{platform.value}'. Is the gateway running with this platform connected?"}
+
+
+async def _delete_message_on_platform(platform, pconfig, chat_id, message_id):
+    """Route confirmed message deletions to the platform-specific implementation."""
+    from gateway.config import Platform
+
+    if platform == Platform.SLACK:
+        result = await _delete_via_adapter(platform, pconfig, chat_id, message_id)
+        if isinstance(result, dict) and result.get("error"):
+            logger.debug(
+                "Live Slack adapter delete unavailable; falling back to direct Web API: %s",
+                result.get("error"),
+            )
+            result = await _delete_slack(pconfig.token, chat_id, message_id)
+        return result
+
+    return await _delete_via_adapter(platform, pconfig, chat_id, message_id)
+
+
+async def _request_delete_confirmation(platform, pconfig, chat_id, message_id, *, reason="", thread_id=None):
+    """Post a Slack-visible confirmation prompt; delete only after approval."""
+    from gateway.config import Platform
+
+    if platform != Platform.SLACK:
+        return {"error": "Deletion confirmation currently supports Slack only."}
+
+    adapter = None
+    try:
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+        if runner:
+            adapter = runner.adapters.get(platform)
+    except Exception as e:
+        return {"error": f"Could not access live Slack adapter for confirmation: {e}"}
+
+    if not adapter or not hasattr(adapter, "send_slash_confirm"):
+        return {"error": "Slack deletion requires the live Slack gateway so EAs/operators can confirm in Slack."}
+
+    from gateway.session_context import get_session_env
+    from tools import slash_confirm
+
+    session_key = get_session_env("HERMES_SESSION_KEY", "") or f"send-message-delete-{uuid.uuid4().hex}"
+    confirm_id = f"delete-slack-message-{uuid.uuid4().hex}"
+    safe_reason = reason or "duplicate or incorrect CoS message"
+
+    async def _on_confirm(choice: str):
+        if choice == "cancel":
+            return f"Slack message deletion cancelled for `{message_id}`."
+        if choice != "once":
+            return "Slack message deletion requires per-message approval. No always-approve path is available."
+
+        result = await _delete_message_on_platform(platform, pconfig, chat_id, message_id)
+        if isinstance(result, dict) and result.get("success"):
+            return f"Deleted Slack message `{message_id}`."
+        error = result.get("error", "unknown error") if isinstance(result, dict) else "unknown error"
+        return (
+            f"Could not delete Slack message `{message_id}`: {_sanitize_error_text(error)}. "
+            "Slack only allows this bot token to delete messages posted by the same bot identity."
+        )
+
+    slash_confirm.register(session_key, confirm_id, "send_message_delete", _on_confirm)
+    prompt = (
+        f"Delete CoS Slack message `{message_id}` in channel `{chat_id}`?\n\n"
+        f"Reason: {safe_reason}\n\n"
+        "Only approve if this is a duplicate or incorrect CoS post. "
+        "Slack will reject the deletion unless the current CoS bot identity posted that message."
+    )
+
+    result = await adapter.send_slash_confirm(
+        chat_id=chat_id,
+        title="Confirm Slack Message Deletion",
+        message=prompt,
+        session_key=session_key,
+        confirm_id=confirm_id,
+        metadata={"thread_id": thread_id, "allow_always": False},
+    )
+    if not result.success:
+        slash_confirm.clear(session_key)
+        return {"error": f"Could not post Slack deletion confirmation: {result.error}"}
+
+    return {
+        "success": True,
+        "confirmation_requested": True,
+        "platform": platform.value,
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "confirmation_message_id": result.message_id,
+    }
+
+
 async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None):
     """Route a message to the appropriate platform sender.
 
@@ -463,13 +852,6 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         _feishu_available = False
 
     media_files = media_files or []
-
-    if platform == Platform.SLACK and message:
-        try:
-            slack_adapter = SlackAdapter.__new__(SlackAdapter)
-            message = slack_adapter.format_message(message)
-        except Exception:
-            logger.debug("Failed to apply Slack mrkdwn formatting in _send_to_platform", exc_info=True)
 
     # Platform message length limits (from adapter class attributes)
     _MAX_LENGTHS = {
@@ -588,11 +970,28 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- Feishu: native media attachment support via adapter ---
+    if platform == Platform.FEISHU and media_files:
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _send_feishu(
+                pconfig,
+                chat_id,
+                chunk,
+                media_files=media_files if is_last else None,
+                thread_id=thread_id,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
     # --- Non-media platforms ---
     if media_files and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal and yuanbao; "
+                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao and feishu; "
                 f"target {platform.value} had only media attachments"
             )
         }
@@ -600,13 +999,19 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if media_files:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal and yuanbao"
+            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao and feishu"
         )
 
     last_result = None
     for chunk in chunks:
         if platform == Platform.SLACK:
-            result = await _send_slack(pconfig.token, chat_id, chunk)
+            result = await _send_via_adapter(platform, pconfig, chat_id, chunk)
+            if isinstance(result, dict) and result.get("error"):
+                logger.debug(
+                    "Live Slack adapter send unavailable; falling back to direct Web API: %s",
+                    result.get("error"),
+                )
+                result = await _send_slack(pconfig.token, chat_id, _format_slack_message(chunk))
         elif platform == Platform.WHATSAPP:
             result = await _send_whatsapp(pconfig.extra, chat_id, chunk)
         elif platform == Platform.SIGNAL:
@@ -1020,6 +1425,59 @@ async def _send_slack(token, chat_id, message):
                 return _error(f"Slack API error: {data.get('error', 'unknown')}")
     except Exception as e:
         return _error(f"Slack send failed: {e}")
+
+
+async def _edit_slack(token, chat_id, message_id, message):
+    """Edit a Slack message via the direct Slack Web API."""
+    try:
+        import aiohttp
+    except ImportError:
+        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+    try:
+        from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
+        _proxy = resolve_proxy_url()
+        _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
+        url = "https://slack.com/api/chat.update"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
+            payload = {
+                "channel": chat_id,
+                "ts": message_id,
+                "text": _format_slack_message(message),
+            }
+            async with session.post(url, headers=headers, json=payload, **_req_kw) as resp:
+                data = await resp.json()
+                if data.get("ok"):
+                    return {"success": True, "platform": "slack", "chat_id": chat_id, "message_id": message_id}
+                return _error(f"Slack API error: {data.get('error', 'unknown')}")
+    except Exception as e:
+        return _error(f"Slack edit failed: {e}")
+
+
+async def _delete_slack(token, chat_id, message_id):
+    """Delete a Slack message via the direct Slack Web API."""
+    try:
+        import aiohttp
+    except ImportError:
+        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+    try:
+        from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
+        _proxy = resolve_proxy_url()
+        _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
+        url = "https://slack.com/api/chat.delete"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
+            payload = {
+                "channel": chat_id,
+                "ts": message_id,
+            }
+            async with session.post(url, headers=headers, json=payload, **_req_kw) as resp:
+                data = await resp.json()
+                if data.get("ok"):
+                    return {"success": True, "platform": "slack", "chat_id": chat_id, "message_id": message_id}
+                return _error(f"Slack API error: {data.get('error', 'unknown')}")
+    except Exception as e:
+        return _error(f"Slack delete failed: {e}")
 
 
 async def _send_whatsapp(extra, chat_id, message):
@@ -1652,8 +2110,8 @@ async def _send_qqbot(pconfig, chat_id, message):
     """Send via QQBot using the REST API directly (no WebSocket needed).
 
     Uses the QQ Bot Open Platform REST endpoints to get an access token
-    and post a message. Works for guild channels without requiring
-    a running gateway adapter.
+    and post a message. Supports guild channels, C2C (private) chats,
+    and group chats by trying the appropriate endpoints.
     """
     try:
         import httpx
@@ -1682,20 +2140,40 @@ async def _send_qqbot(pconfig, chat_id, message):
                 return _error(f"QQBot: no access_token in response")
 
             # Step 2: Send message via REST
+            # QQ Bot API has separate endpoints for channels, C2C, and groups.
+            # We try them in order: channel first, then fallback to C2C.
             headers = {
                 "Authorization": f"QQBot {access_token}",
                 "Content-Type": "application/json",
             }
-            url = f"https://api.sgroup.qq.com/channels/{chat_id}/messages"
             payload = {"content": message[:4000], "msg_type": 0}
 
+            # Try channel endpoint first (works for guild channels)
+            url = f"https://api.sgroup.qq.com/channels/{chat_id}/messages"
             resp = await client.post(url, json=payload, headers=headers)
             if resp.status_code in (200, 201):
                 data = resp.json()
                 return {"success": True, "platform": "qqbot", "chat_id": chat_id,
                         "message_id": data.get("id")}
-            else:
-                return _error(f"QQBot send failed: {resp.status_code} {resp.text}")
+
+            # If channel endpoint failed (likely "频道不存在"), try C2C endpoint
+            url_c2c = f"https://api.sgroup.qq.com/v2/users/{chat_id}/messages"
+            resp_c2c = await client.post(url_c2c, json=payload, headers=headers)
+            if resp_c2c.status_code in (200, 201):
+                data = resp_c2c.json()
+                return {"success": True, "platform": "qqbot", "chat_id": chat_id,
+                        "message_id": data.get("id")}
+
+            # If C2C also failed, try group endpoint
+            url_group = f"https://api.sgroup.qq.com/v2/groups/{chat_id}/messages"
+            resp_group = await client.post(url_group, json=payload, headers=headers)
+            if resp_group.status_code in (200, 201):
+                data = resp_group.json()
+                return {"success": True, "platform": "qqbot", "chat_id": chat_id,
+                        "message_id": data.get("id")}
+
+            # All endpoints failed — return the most informative error
+            return _error(f"QQBot send failed: channel={resp.status_code} c2c={resp_c2c.status_code} group={resp_group.status_code}")
     except Exception as e:
         return _error(f"QQBot send failed: {e}")
 
