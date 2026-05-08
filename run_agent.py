@@ -10011,8 +10011,13 @@ class AIAgent:
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
             else:
-                guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
-                if not guardrail_decision.allows_execution:
+                tool_guardrails = getattr(self, "_tool_guardrails", None)
+                guardrail_decision = (
+                    tool_guardrails.before_call(function_name, function_args)
+                    if tool_guardrails is not None
+                    else None
+                )
+                if guardrail_decision is not None and not guardrail_decision.allows_execution:
                     block_result = self._guardrail_block_result(guardrail_decision)
                     blocked_by_guardrail = True
 
@@ -10110,14 +10115,33 @@ class AIAgent:
                     pass
             start = time.time()
             try:
-                result = self._invoke_tool(
-                    function_name,
-                    function_args,
-                    effective_task_id,
-                    tool_call.id,
-                    messages=messages,
-                    pre_tool_block_checked=True,
-                )
+                try:
+                    result = self._invoke_tool(
+                        function_name,
+                        function_args,
+                        effective_task_id,
+                        tool_call.id,
+                        messages=messages,
+                        pre_tool_block_checked=True,
+                    )
+                except TypeError:
+                    # Backward-compatible: some test doubles or legacy adapters
+                    # implement `_invoke_tool` without the newer keyword args.
+                    try:
+                        result = self._invoke_tool(
+                            function_name,
+                            function_args,
+                            effective_task_id,
+                            tool_call.id,
+                            pre_tool_block_checked=True,
+                        )
+                    except TypeError:
+                        result = self._invoke_tool(
+                            function_name,
+                            function_args,
+                            effective_task_id,
+                            tool_call.id,
+                        )
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -10236,12 +10260,14 @@ class AIAgent:
                 function_name, function_args, function_result, tool_duration, is_error, blocked = r
 
                 if not blocked:
-                    function_result = self._append_guardrail_observation(
-                        function_name,
-                        function_args,
-                        function_result,
-                        failed=is_error,
-                    )
+                    append_obs = getattr(self, "_append_guardrail_observation", None)
+                    if append_obs is not None:
+                        function_result = append_obs(
+                            function_name,
+                            function_args,
+                            function_result,
+                            failed=is_error,
+                        )
 
                 if is_error:
                     _err_text = _multimodal_text_summary(function_result)

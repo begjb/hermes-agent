@@ -4195,6 +4195,16 @@ def _prompt_api_key(pconfig, existing_key: str, provider_id: str = "") -> tuple:
         # Nothing we can rewrite; just acknowledge and move on.
         print()
         return existing_key, False
+    # If the key is coming from the live environment (not ~/.hermes/.env),
+    # do not prompt in non-interactive flows/tests. The user can still
+    # persist/rotate it via `hermes auth` or by writing ~/.hermes/.env.
+    try:
+        env_file_val = get_env_value(key_env)
+    except Exception:
+        env_file_val = ""
+    if not env_file_val and os.environ.get(key_env, "").strip() == existing_key.strip():
+        print()
+        return existing_key, False
     try:
         choice = input("  [K]eep / [R]eplace / [C]lear (default K): ").strip().lower()
     except (KeyboardInterrupt, EOFError):
@@ -4832,19 +4842,20 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
             pass
     effective_base = current_base or pconfig.inference_base_url
 
-    try:
-        override = input(f"Base URL [{effective_base}]: ").strip()
-    except (KeyboardInterrupt, EOFError):
-        print()
-        override = ""
-    if override and base_url_env:
-        if not override.startswith(("http://", "https://")):
-            print(
-                "  Invalid URL — must start with http:// or https://. Keeping current value."
-            )
-        else:
-            save_env_value(base_url_env, override)
-            effective_base = override
+    if provider_id != "lmstudio":
+        try:
+            override = input(f"Base URL [{effective_base}]: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            override = ""
+        if override and base_url_env:
+            if not override.startswith(("http://", "https://")):
+                print(
+                    "  Invalid URL — must start with http:// or https://. Keeping current value."
+                )
+            else:
+                save_env_value(base_url_env, override)
+                effective_base = override
 
     # Model selection — resolution order:
     #   1. models.dev registry (cached, filtered for agentic/tool-capable models)

@@ -398,6 +398,7 @@ _pending: dict[str, dict] = {}
 _session_approved: dict[str, set] = {}
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
+_pre_resolved: dict[str, str] = {}
 
 # =========================================================================
 # Blocking gateway approval (mirrors CLI's synchronous input() flow)
@@ -461,6 +462,10 @@ def resolve_gateway_approval(session_key: str, choice: str,
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
+            # Race: user approves/denies before the agent thread finished
+            # enqueueing the approval entry. Record the choice so the next
+            # approval request can be resolved immediately.
+            _pre_resolved[session_key] = choice
             return 0
         if resolve_all:
             targets = list(queue)
@@ -1097,7 +1102,12 @@ def check_all_command_guards(command: str, env_type: str,
             }
             entry = _ApprovalEntry(approval_data)
             with _lock:
-                _gateway_queues.setdefault(session_key, []).append(entry)
+                pre_choice = _pre_resolved.pop(session_key, None)
+                if pre_choice:
+                    entry.result = pre_choice
+                    entry.event.set()
+                else:
+                    _gateway_queues.setdefault(session_key, []).append(entry)
 
             # Notify plugins that an approval is being requested. Fires before
             # the gateway notify callback so observers (e.g. macOS notifier

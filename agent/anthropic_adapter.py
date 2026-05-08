@@ -76,7 +76,7 @@ _ADAPTIVE_THINKING_SUBSTRINGS = ("4-6", "4.6", "4-7", "4.7")
 # Models where temperature/top_p/top_k return 400 if set to non-default values.
 # This is the Opus 4.7 contract; future 4.x+ models are expected to follow it.
 _NO_SAMPLING_PARAMS_SUBSTRINGS = ("4-7", "4.7")
-_FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-6", "opus-4.6")
+_FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-6", "opus-4.6", "opus-4-7", "opus-4.7")
 
 # ── Max output token limits per Anthropic model ───────────────────────
 # Source: Anthropic docs + Cline model catalog.  Anthropic's API requires
@@ -245,17 +245,17 @@ def _supports_fast_mode(model: str) -> bool:
 # ``context-1m-2025-08-07`` is still required to unlock the 1M context window
 # on Claude Opus 4.6/4.7 and Sonnet 4.6 when served via AWS Bedrock or Azure
 # AI Foundry. Add it only for those endpoint-specific paths below.
-_COMMON_BETAS = [
-    "interleaved-thinking-2025-05-14",
-    "fine-grained-tool-streaming-2025-05-14",
-]
 # MiniMax's Anthropic-compatible endpoints fail tool-use requests when
 # the fine-grained tool streaming beta is present.  Omit it so tool calls
 # fall back to the provider's default response path.
 _TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14"
-# 1M context beta. Native Anthropic does not get this by default because some
-# subscriptions reject it, but Bedrock/Azure still need it for 1M context.
+# 1M context beta.
 _CONTEXT_1M_BETA = "context-1m-2025-08-07"
+_COMMON_BETAS = [
+    "interleaved-thinking-2025-05-14",
+    "fine-grained-tool-streaming-2025-05-14",
+    _CONTEXT_1M_BETA,
+]
 
 # Fast mode beta — enables the ``speed: "fast"`` request parameter for
 # significantly higher output token throughput on Opus 4.6 (~2.5x).
@@ -501,8 +501,6 @@ def _common_betas_for_base_url(
     would otherwise include it after a subscription/endpoint rejects the beta.
     """
     betas = list(_COMMON_BETAS)
-    if _base_url_needs_context_1m_beta(base_url) and not drop_context_1m_beta:
-        betas.append(_CONTEXT_1M_BETA)
     if _requires_bearer_auth(base_url):
         _stripped = {_TOOL_STREAMING_BETA, _CONTEXT_1M_BETA}
         return [b for b in betas if b not in _stripped]
@@ -2060,5 +2058,3 @@ def build_anthropic_kwargs(
         kwargs["extra_headers"] = {"anthropic-beta": ",".join(betas)}
 
     return kwargs
-
-

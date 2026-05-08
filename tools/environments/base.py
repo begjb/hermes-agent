@@ -346,7 +346,7 @@ class BaseEnvironment(ABC):
             f"echo 'shopt -s expand_aliases' >> {self._snapshot_path}\n"
             f"echo 'set +e' >> {self._snapshot_path}\n"
             f"echo 'set +u' >> {self._snapshot_path}\n"
-            f"builtin cd {_quoted_cwd} 2>/dev/null || true\n"
+            f"cd {_quoted_cwd} 2>/dev/null || true\n"
             f"pwd -P > {self._cwd_file} 2>/dev/null || true\n"
             f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\"\n"
         )
@@ -405,8 +405,7 @@ class BaseEnvironment(ABC):
         # Preserve bare ``~`` expansion, but rewrite ``~/...`` through
         # ``$HOME`` so suffixes with spaces remain a single shell word.
         quoted_cwd = self._quote_cwd_for_cd(cwd)
-        # ``--`` keeps hyphen-prefixed directory names from being parsed as options.
-        parts.append(f"builtin cd -- {quoted_cwd} || exit 126")
+        parts.append(f"cd {quoted_cwd} || exit 126")
 
         # Run the actual command
         parts.append(f"eval '{escaped}'")
@@ -803,4 +802,3 @@ class BaseEnvironment(ABC):
         from tools.terminal_tool import _transform_sudo_command
 
         return _transform_sudo_command(command)
-
