@@ -43,7 +43,27 @@ jobs:
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
 
+      - name: Run focused Athena upstream-sync tests
+        if: ${{ startsWith(github.head_ref || github.ref_name, 'athena/upstream-sync-') }}
+        run: |
+          source .venv/bin/activate
+          python -m py_compile gateway/platforms/slack.py tools/send_message_tool.py
+          python -m pytest -o addopts='' \
+            tests/tools/test_send_message_tool.py::TestSendMessageTool::test_delete_action_deletes_directly_by_default \
+            tests/tools/test_send_message_tool.py::TestSendMessageTool::test_delete_action_requests_slack_confirmation_when_confirm_true \
+            tests/tools/test_send_message_tool.py::TestSendMessageTool::test_delete_action_requires_message_id \
+            tests/tools/test_send_message_tool.py::TestDeleteSlackDirect \
+            tests/gateway/test_slack_approval_buttons.py::TestSlackSlashConfirm::test_can_hide_always_approve_button \
+            tests/gateway/test_slack.py::TestUserNameResolution::test_falls_back_to_real_name \
+            -q
+        env:
+          # Ensure tests don't accidentally call real APIs
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
       - name: Run tests
+        if: ${{ !startsWith(github.head_ref || github.ref_name, 'athena/upstream-sync-') }}
         run: |
           source .venv/bin/activate
           python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto
