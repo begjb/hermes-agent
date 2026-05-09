@@ -3776,18 +3776,8 @@ def call_llm(
             or _is_unsupported_parameter_error(first_err, "max_tokens")
             or _is_zai_param_error
         ):
-            _requested_mt = (
-                kwargs.get("max_completion_tokens")
-                or kwargs.get("max_tokens")
-                or max_tokens
-            )
             kwargs.pop("max_tokens", None)
             kwargs.pop("max_completion_tokens", None)
-            if (
-                _requested_mt is not None
-                and base_url_hostname(_base_info or "") in {"api.openai.com", "api.githubcopilot.com"}
-            ):
-                kwargs["max_completion_tokens"] = int(_requested_mt)
             try:
                 return _validate_llm_response(
                     client.chat.completions.create(**kwargs), task)
@@ -4102,18 +4092,8 @@ async def async_call_llm(
             or _is_unsupported_parameter_error(first_err, "max_tokens")
             or _is_zai_param_error
         ):
-            _requested_mt = (
-                kwargs.get("max_completion_tokens")
-                or kwargs.get("max_tokens")
-                or max_tokens
-            )
             kwargs.pop("max_tokens", None)
             kwargs.pop("max_completion_tokens", None)
-            if (
-                _requested_mt is not None
-                and base_url_hostname(_client_base or "") in {"api.openai.com", "api.githubcopilot.com"}
-            ):
-                kwargs["max_completion_tokens"] = int(_requested_mt)
             try:
                 return _validate_llm_response(
                     await client.chat.completions.create(**kwargs), task)

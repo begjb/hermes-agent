@@ -1401,12 +1401,13 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     changed = False
     active_sources: Set[str] = set()
 
-    # Prefer os.environ over ~/.hermes/.env so callers can override keys for a
-    # single process invocation (tests, one-off runs). Fall back to ~/.hermes/.env
-    # when the variable is not exported in the current process.
+    # Prefer ~/.hermes/.env over os.environ — the user's config file is the
+    # authoritative source for Hermes credentials. Stale env vars from parent
+    # processes (Codex CLI, test scripts, etc.) should not override deliberate
+    # changes to the .env file.
     def _get_env_prefer_dotenv(key: str) -> str:
         env_file = load_env()
-        val = os.environ.get(key) or env_file.get(key) or ""
+        val = env_file.get(key) or os.environ.get(key) or ""
         return val.strip()
 
     # Honour user suppression — `hermes auth remove <provider> <N>` for an
