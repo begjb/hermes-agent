@@ -1737,6 +1737,147 @@ def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     assert reason is None
 
 
+def test_respawn_guard_review_required_block_suppresses_active_pr(kanban_home):
+    """A ``review-required:`` block reason suppresses the active_pr guard.
+
+    Review-drain workflows: author blocks with ``review-required: ...``
+    after posting a PR URL in a comment; reviewer is routed in via
+    reassign + unblock. The PR URL is the handoff signal — the dispatcher
+    must spawn the reviewer on the same task, not refuse with active_pr.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="under-review", assignee="alice")
+        # Author posts the PR URL in a comment (the handoff payload).
+        kb.add_comment(
+            conn, t, "alice",
+            "review-required handoff: PR at "
+            "https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        # Author claims + blocks with review-required: reason.
+        kb.claim_task(conn, t)
+        kb.block_task(
+            conn, t,
+            reason="review-required: PR #42 ready for engineering-shape review",
+        )
+        # Reviewer unblocks and gets reassigned in.
+        kb.unblock_task(conn, t)
+        conn.execute(
+            "UPDATE tasks SET assignee = 'reviewer' WHERE id = ?", (t,),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None  # Guard suppressed; spawn proceeds.
+
+
+def test_respawn_guard_non_review_block_still_guards_active_pr(kanban_home):
+    """A non-review block reason does NOT suppress the active_pr guard.
+
+    Ensures the exception is narrowly scoped to ``review-required:``
+    and doesn't accidentally swallow legitimate active_pr triggers
+    after generic blocks (e.g. ``stuck: need human input``).
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="stuck-with-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "alice",
+            "PR open: https://github.com/totemx-AI/subsidysmart/pull/43",
+        )
+        kb.claim_task(conn, t)
+        kb.block_task(conn, t, reason="stuck: need human input on API choice")
+        kb.unblock_task(conn, t)
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_review_exception_does_not_leak_past_completion(
+    kanban_home,
+):
+    """After a ``completed`` event lands AFTER the review block, the
+    exception no longer applies.
+
+    Scenario: review-drain ran, the task completed, the same PR URL
+    sits in comment history within window. A subsequent ready→spawn
+    attempt (e.g. dispatcher re-opens for follow-up work) must see the
+    active_pr guard fire — the old ``review-required:`` block is no
+    longer the *most recent* status event because ``completed`` came
+    after it.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="post-review-followup", assignee="alice")
+        kb.add_comment(
+            conn, t, "alice",
+            "review-required handoff: PR at "
+            "https://github.com/totemx-AI/subsidysmart/pull/44",
+        )
+        kb.claim_task(conn, t)
+        kb.block_task(conn, t, reason="review-required: PR #44 review needed")
+        kb.unblock_task(conn, t)
+        # Simulate the reviewer drain landing as a completed event AFTER
+        # the review-required block. Use a created_at strictly greater
+        # than the blocked event's created_at so ORDER BY DESC picks
+        # ``completed`` as the most recent.
+        latest_blocked_ts = conn.execute(
+            "SELECT created_at FROM task_events "
+            "WHERE task_id = ? AND kind = 'blocked' "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (t,),
+        ).fetchone()["created_at"]
+        # Place completion well outside the recent-success window so it
+        # doesn't shadow the guard via the ``recent_success`` path; that
+        # path checks task_runs.ended_at, which we leave un-set here.
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'completed', '{}', ?)",
+            (t, latest_blocked_ts + 10),
+        )
+        # PR URL still present in comment history (well within window).
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"  # Exception expired with the completion.
+
+
+def test_review_required_handoff_active_returns_false_on_fresh_task(
+    kanban_home,
+):
+    """No blocked events → exception predicate returns False (default safe)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="fresh", assignee="alice")
+        assert kb._review_required_handoff_active(conn, t) is False
+
+
+def test_review_required_handoff_active_matches_prefix_only(kanban_home):
+    """The predicate matches only block reasons starting with ``review-required:``.
+
+    Substring matches inside other reasons (e.g. ``decision-required: ...
+    review-required if approved``) must not trigger the exception.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="decision-not-review", assignee="alice")
+        kb.claim_task(conn, t)
+        kb.block_task(
+            conn, t,
+            reason="decision-required: ratify approach (review-required if approved)",
+        )
+        assert kb._review_required_handoff_active(conn, t) is False
+
+
+def test_review_required_handoff_active_tolerates_leading_whitespace(
+    kanban_home,
+):
+    """``  review-required: foo`` (with leading whitespace) still matches.
+
+    jm-scan-drift and similar tooling can prefix block reasons with
+    bracket suffixes ``[auto-reblocked by ...]`` but those land at the
+    END; leading whitespace is what we tolerate. Quoted via lstrip().
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="ws-prefixed-reason", assignee="alice")
+        kb.claim_task(conn, t)
+        kb.block_task(
+            conn, t,
+            reason="   review-required: PR ready for review",
+        )
+        assert kb._review_required_handoff_active(conn, t) is True
+
+
 def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
     kanban_home, all_assignees_spawnable
 ):
