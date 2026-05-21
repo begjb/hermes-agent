@@ -5820,6 +5820,13 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
 
+        **Exception:** if the task's most recent ``blocked`` event carried
+        a ``review-required:`` reason, the active_pr guard is suppressed.
+        The PR URL in comments is the handoff signal to the reviewer in
+        that case, not a duplicate-PR risk — review-drain workflows need
+        the dispatcher to spawn a reviewer worker on the same task as the
+        author. See ``_review_required_handoff_active`` for the check.
+
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
     reset the task to ``ready`` only after verifying the lock is
@@ -5849,15 +5856,83 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         return "recent_success"
 
     # 3. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+    #
+    # Exception: if the task's most recent ``blocked`` event carried a
+    # ``review-required:`` reason, the PR URL in comments is the HANDOFF
+    # signal to the reviewer, not a duplicate-PR risk. Skip the active_pr
+    # guard in that case so review-drain workflows can spawn normally.
+    # See ``_review_required_handoff_active`` for the discriminator.
+    if not _review_required_handoff_active(conn, task_id):
+        pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+        for c in conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+            (task_id, pr_cutoff),
+        ).fetchall():
+            if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+                return "active_pr"
 
     return None
+
+
+def _review_required_handoff_active(
+    conn: sqlite3.Connection, task_id: str
+) -> bool:
+    """Return True iff the task's most recent ``blocked`` event carried a
+    ``review-required:`` reason.
+
+    Used by ``check_respawn_guard`` to disable the ``active_pr`` guard for
+    review-drain workflows: when an author blocks with
+    ``review-required: ...`` and a reviewer is routed in (via
+    ``reassign`` + ``unblock``), the PR URL in the handoff comment is the
+    signal the reviewer needs to find the PR — not evidence that a
+    duplicate PR is about to be opened.
+
+    Reads the latest ``blocked`` event's ``reason`` payload field (a
+    JSON-encoded payload column on ``task_events``). Returns False when:
+
+    - the task has no ``blocked`` event in its history
+    - the latest ``blocked`` event has no parseable reason
+    - the reason does not start with ``review-required:``
+    - a more recent ``completed`` event exists (the review has already
+      drained; we're now in a fresh work cycle)
+
+    The check is intentionally narrow: it looks at the SINGLE most-recent
+    block event, not a substring scan of all history. This keeps the
+    exception scoped to the active review-drain — once the reviewer
+    drains and the author completes the task, subsequent re-spawns
+    revert to the normal active_pr behavior.
+    """
+    row = conn.execute(
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('blocked', 'completed', 'unblocked') "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    # If the most recent terminal-ish event is ``completed``, the prior
+    # review drained and we're past it; do not extend the exception.
+    if row["kind"] == "completed":
+        return False
+    # Search for the most recent ``blocked`` event explicitly. ``unblocked``
+    # alone doesn't tell us why the task was blocked; we need the matching
+    # ``blocked`` event before it.
+    blocked = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'blocked' "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if blocked is None or not blocked["payload"]:
+        return False
+    try:
+        payload = json.loads(blocked["payload"])
+    except (json.JSONDecodeError, TypeError):
+        return False
+    reason = payload.get("reason") if isinstance(payload, dict) else None
+    if not isinstance(reason, str):
+        return False
+    return reason.lstrip().startswith("review-required:")
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
