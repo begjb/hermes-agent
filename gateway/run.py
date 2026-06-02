@@ -18670,7 +18670,10 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     tick_count = 0
     while not stop_event.is_set():
         try:
-            cron_tick(verbose=False, adapters=adapters, loop=loop)
+            # Dispatch-only: hand due jobs to the persistent cron executor and
+            # return immediately so a multi-minute LLM cron never holds this
+            # ticker thread and starves fast scan crons (jetminds 2026-06-02).
+            cron_tick(verbose=False, adapters=adapters, loop=loop, blocking=False)
         except Exception as e:
             logger.debug("Cron tick error: %s", e)
 
@@ -18735,6 +18738,17 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
                 logger.debug("Curator tick error: %s", e)
 
         stop_event.wait(timeout=interval)
+    # Signal the persistent dispatch executor to wind down (best-effort).
+    # wait=False: we do NOT block gateway exit on in-flight cron jobs — that
+    # would reintroduce the multi-minute stall this fix exists to remove. Any
+    # job still running is interrupted at interpreter exit; at-most-once is
+    # already guaranteed because next_run_at was advanced under the lock before
+    # dispatch, so an interrupted job is not silently re-fired on restart.
+    try:
+        from cron.scheduler import shutdown_persistent_cron_executor
+        shutdown_persistent_cron_executor(wait=False)
+    except Exception as e:
+        logger.debug("Cron dispatch executor shutdown error: %s", e)
     logger.info("Cron ticker stopped")
 
 

@@ -11,6 +11,7 @@ runs at a time if multiple processes overlap.
 import asyncio
 import concurrent.futures
 import contextvars
+import threading
 import json
 import logging
 import os
@@ -1854,7 +1855,87 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def tick(verbose: bool = True, adapters=None, loop=None) -> int:
+# ---------------------------------------------------------------------------
+# Persistent dispatch executor (non-blocking tick path)
+# ---------------------------------------------------------------------------
+#
+# Background: the gateway's cron ticker is a single serial loop —
+# cron_tick() -> stop_event.wait(60) -> repeat.  Historically tick() executed
+# every due job inline and only returned once the slowest job finished, so a
+# multi-minute no_agent=False LLM cron (e.g. an ~8-minute triage agent) held
+# the ticker thread for that whole duration.  Fast no_agent scan crons with a
+# short catch-up grace (period/2 — 150s for a 5-minute job) were therefore
+# always re-evaluated >grace late and got fast-forward-skipped in
+# cron/jobs._get_due_jobs_locked forever (jetminds incident 2026-06-02).
+#
+# Fix: dispatch-only (non-blocking) tick.  The lock-protected critical section
+# — due-detection + advance_next_run — stays synchronous and fast; job
+# execution is handed to this persistent executor and the tick returns
+# immediately.  Because advance_next_run runs under the lock BEFORE dispatch,
+# at-most-once is preserved: a job whose execution is still in flight has
+# already had its next_run_at advanced, so a subsequent tick will not re-pick
+# it.  The executor outlives individual ticks so long jobs keep running while
+# the ticker continues on cadence.
+_persistent_cron_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_persistent_cron_executor_lock = threading.Lock()
+
+
+def _resolve_cron_max_workers() -> Optional[int]:
+    """Resolve max parallel cron workers: env > config.yaml > unbounded (None)."""
+    _max_workers: Optional[int] = None
+    try:
+        _env_par = os.getenv("HERMES_CRON_MAX_PARALLEL", "").strip()
+        if _env_par:
+            _max_workers = int(_env_par) or None
+    except (ValueError, TypeError):
+        logger.warning("Invalid HERMES_CRON_MAX_PARALLEL value; defaulting to unbounded")
+    if _max_workers is None:
+        try:
+            _ucfg = load_config() or {}
+            _cfg_par = (
+                _ucfg.get("cron", {}) if isinstance(_ucfg, dict) else {}
+            ).get("max_parallel_jobs")
+            if _cfg_par is not None:
+                _max_workers = int(_cfg_par) or None
+        except Exception:
+            pass
+    return _max_workers
+
+
+def get_persistent_cron_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Return the process-wide executor used to run dispatched cron jobs.
+
+    Lazily created.  Worker count is bounded by HERMES_CRON_MAX_PARALLEL /
+    cron.max_parallel_jobs (same knob as the per-tick pool), defaulting to a
+    generous bound so a slow job never blocks dispatch of the next one.
+    """
+    global _persistent_cron_executor
+    with _persistent_cron_executor_lock:
+        if _persistent_cron_executor is None:
+            _max_workers = _resolve_cron_max_workers()
+            # ThreadPoolExecutor requires a positive worker count; map the
+            # "unbounded" sentinel (None) to a high-but-finite ceiling so we
+            # never serialize dispatch behind a single worker.
+            _workers = _max_workers if _max_workers and _max_workers > 0 else 32
+            _persistent_cron_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=_workers,
+                thread_name_prefix="cron-dispatch",
+            )
+        return _persistent_cron_executor
+
+
+def shutdown_persistent_cron_executor(wait: bool = False) -> None:
+    """Tear down the persistent dispatch executor (gateway shutdown / tests)."""
+    global _persistent_cron_executor
+    with _persistent_cron_executor_lock:
+        if _persistent_cron_executor is not None:
+            try:
+                _persistent_cron_executor.shutdown(wait=wait)
+            finally:
+                _persistent_cron_executor = None
+
+
+def tick(verbose: bool = True, adapters=None, loop=None, blocking: bool = True) -> int:
     """
     Check and run all due jobs.
     
@@ -1903,23 +1984,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
-        _max_workers: Optional[int] = None
-        try:
-            _env_par = os.getenv("HERMES_CRON_MAX_PARALLEL", "").strip()
-            if _env_par:
-                _max_workers = int(_env_par) or None
-        except (ValueError, TypeError):
-            logger.warning("Invalid HERMES_CRON_MAX_PARALLEL value; defaulting to unbounded")
-        if _max_workers is None:
-            try:
-                _ucfg = load_config() or {}
-                _cfg_par = (
-                    _ucfg.get("cron", {}) if isinstance(_ucfg, dict) else {}
-                ).get("max_parallel_jobs")
-                if _cfg_par is not None:
-                    _max_workers = int(_cfg_par) or None
-            except Exception:
-                pass
+        _max_workers: Optional[int] = _resolve_cron_max_workers()
 
         if verbose:
             logger.info(
@@ -1988,6 +2053,58 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
             if not ((j.get("workdir") or "").strip() or (j.get("profile") or "").strip())
         ]
 
+        def _post_tick_mcp_sweep() -> None:
+            # Best-effort sweep of MCP stdio subprocesses that survived their
+            # session teardown.  Runs AFTER every job in this batch has
+            # finished so active sessions (including live user chats) are
+            # never touched — only PIDs explicitly detected as orphans in
+            # tools.mcp_tool._run_stdio's finally block are reaped.
+            try:
+                from tools.mcp_tool import _kill_orphaned_mcp_children
+                _kill_orphaned_mcp_children()
+            except Exception as _e:
+                logger.debug("Post-tick MCP orphan cleanup failed: %s", _e)
+
+        if not blocking:
+            # ---- Dispatch-only path (gateway ticker) -----------------------
+            # next_run_at was already advanced under the lock above, so handing
+            # execution to the persistent executor and returning now cannot
+            # cause a re-pick.  The ticker thread is freed immediately and keeps
+            # its cadence regardless of how long individual jobs run.  This is
+            # the fix for the serial-blocking starvation (jetminds 2026-06-02).
+            executor = get_persistent_cron_executor()
+
+            def _run_batch_off_thread() -> None:
+                # Sequential jobs share process-global state, so run them in
+                # order inside this single background task; parallel jobs fan
+                # out across the executor's workers.  The MCP sweep runs once
+                # the whole dispatched batch has drained.
+                _futs = []
+                for job in parallel_jobs:
+                    _ctx = contextvars.copy_context()
+                    _futs.append(executor.submit(_ctx.run, _process_job, job))
+                for job in sequential_jobs:
+                    _ctx = contextvars.copy_context()
+                    try:
+                        _ctx.run(_process_job, job)
+                    except Exception as exc:
+                        logger.error("Sequential cron job failed: %s", exc)
+                for f in _futs:
+                    try:
+                        f.result()
+                    except Exception as exc:
+                        logger.error("Dispatched cron job future failed: %s", exc)
+                _post_tick_mcp_sweep()
+
+            # Drive the batch coordinator itself off-thread so even submitting
+            # the sequential jobs (which run inline in the coordinator) never
+            # blocks the ticker.
+            executor.submit(_run_batch_off_thread)
+            return len(due_jobs)
+
+        # ---- Blocking path (manual `hermes cron tick`, daemon, tests) ------
+        # Preserves the historical contract: wait for every job, return the
+        # count actually executed (used for exit codes / determinism).
         _results: list = []
 
         # Sequential pass for env/context-mutating jobs.
@@ -2009,16 +2126,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                         logger.error("Parallel cron job future failed: %s", exc)
                         _results.append(False)
 
-        # Best-effort sweep of MCP stdio subprocesses that survived their
-        # session teardown during this tick.  Runs AFTER every job has
-        # finished so active sessions (including live user chats) are
-        # never touched — only PIDs explicitly detected as orphans in
-        # tools.mcp_tool._run_stdio's finally block are reaped.
-        try:
-            from tools.mcp_tool import _kill_orphaned_mcp_children
-            _kill_orphaned_mcp_children()
-        except Exception as _e:
-            logger.debug("Post-tick MCP orphan cleanup failed: %s", _e)
+        _post_tick_mcp_sweep()
 
         return sum(_results)
     finally:
