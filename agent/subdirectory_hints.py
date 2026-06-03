@@ -135,7 +135,12 @@ class SubdirectoryHintTracker:
                 if parent == p:
                     break  # filesystem root
                 p = parent
-        except (OSError, ValueError):
+        except (OSError, ValueError, RuntimeError):
+            # RuntimeError: Path.expanduser() raises "Could not determine home
+            # directory." when HOME is unset and the pwd lookup also fails
+            # (e.g. sandbox/cron contexts). Subdir-hint discovery is best-effort,
+            # so swallow it like the other path-resolution failures rather than
+            # letting it terminate the conversation loop.
             pass
 
     def _extract_paths_from_command(self, cmd: str, candidates: Set[Path]):
