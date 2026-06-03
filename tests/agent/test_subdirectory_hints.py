@@ -325,3 +325,57 @@ class TestOutsideWorkspaceRejection:
         outside.mkdir(exist_ok=True)
         tracker = SubdirectoryHintTracker(working_dir=str(project))
         assert tracker._is_valid_subdir(outside) is False
+
+
+class TestExpanduserRuntimeError:
+    """Regression tests for RuntimeError from Path.expanduser() when HOME is unset.
+
+    Path.expanduser() raises RuntimeError("Could not determine home directory.")
+    when the HOME environment variable is unavailable and the pwd-based lookup
+    also fails (e.g. sandbox / cron-runner contexts). Before the fix the except
+    clause caught only (OSError, ValueError), so the RuntimeError propagated up
+    through check_tool_call -> tool_executor -> the conversation loop and
+    terminated the entire cron run. Subdir-hint discovery is best-effort, so the
+    failure must be swallowed like the other path-resolution errors.
+    """
+
+    def test_add_path_candidate_survives_expanduser_runtimeerror(self, project):
+        """_add_path_candidate should swallow RuntimeError from expanduser()."""
+        tracker = SubdirectoryHintTracker(working_dir=str(project))
+        candidates: set = set()
+        with patch.object(
+            Path,
+            "expanduser",
+            side_effect=RuntimeError("Could not determine home directory."),
+        ):
+            # Must not raise — best-effort discovery degrades gracefully.
+            tracker._add_path_candidate("~/some/path", candidates)
+        assert candidates == set()
+
+    def test_check_tool_call_survives_expanduser_runtimeerror(self, project):
+        """Full check_tool_call must not crash when expanduser() raises RuntimeError."""
+        tracker = SubdirectoryHintTracker(working_dir=str(project))
+        with patch.object(
+            Path,
+            "expanduser",
+            side_effect=RuntimeError("Could not determine home directory."),
+        ):
+            # Reproduces the cron-runner crash: a tool call whose path token
+            # hits expanduser() with HOME unset. Must return cleanly, not raise.
+            result = tracker.check_tool_call(
+                "read_file", {"path": str(project / "backend" / "src" / "main.py")}
+            )
+        assert result is None or isinstance(result, str)
+
+    def test_terminal_command_survives_expanduser_runtimeerror(self, project):
+        """The terminal-command path extraction must also survive RuntimeError."""
+        tracker = SubdirectoryHintTracker(working_dir=str(project))
+        with patch.object(
+            Path,
+            "expanduser",
+            side_effect=RuntimeError("Could not determine home directory."),
+        ):
+            result = tracker.check_tool_call(
+                "terminal", {"command": "cat ~/frontend/index.ts"}
+            )
+        assert result is None or isinstance(result, str)
