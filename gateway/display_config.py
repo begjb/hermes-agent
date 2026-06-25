@@ -231,6 +231,7 @@ def _normalise(setting: str, value: Any) -> Any:
         "interim_assistant_messages",
         "long_running_notifications",
         "busy_ack_detail",
+        "status_line_progress",
     }:
         if isinstance(value, str):
             return value.lower() in {"true", "1", "yes", "on"}
