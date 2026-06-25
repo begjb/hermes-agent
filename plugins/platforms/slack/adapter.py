@@ -320,6 +320,7 @@ class SlackAdapter(BasePlatformAdapter):
 
     MAX_MESSAGE_LENGTH = 39000  # Slack API allows 40,000 chars; leave margin
     supports_code_blocks = True  # Slack mrkdwn renders fenced code blocks
+    supports_status_line = True
     # Slack blocks typed native slash commands inside threads ("/approve is
     # not supported in threads. Sorry!").  The adapter rewrites a leading
     # "!" to "/" for known commands (see _handle_slack_message), so "!" is
@@ -1712,10 +1713,12 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return False
 
-    async def send_typing(self, chat_id: str, metadata=None) -> None:
+    async def send_typing(
+        self, chat_id: str, metadata=None, status: str = "is thinking..."
+    ) -> None:
         """Show a typing/status indicator using assistant.threads.setStatus.
 
-        Displays "is thinking..." next to the bot name in a thread.
+        Displays the given status next to the bot name in a thread.
         Requires the assistant:write or chat:write scope.
         Auto-clears when the bot sends a reply to the thread.
         """
@@ -1734,12 +1737,30 @@ class SlackAdapter(BasePlatformAdapter):
             await self._get_client(chat_id).assistant_threads_setStatus(
                 channel_id=chat_id,
                 thread_ts=thread_ts,
-                status="is thinking...",
+                status=status,
             )
         except Exception as e:
             # Silently ignore — may lack assistant:write scope or not be
             # in an assistant-enabled context. Falls back to reactions.
             logger.debug("[Slack] assistant.threads.setStatus failed: %s", e)
+
+    async def update_thread_status(self, chat_id: str, label: str, metadata=None) -> None:
+        """Update the native Slack assistant status line with an audience-safe label.
+
+        Falls back to the thread the turn-start typing indicator already
+        established (``_active_status_threads``) when the caller's metadata
+        lacks a thread reference.  Without this, a top-level @mention — where
+        ``source.thread_id`` is None, so the gateway's progress metadata is
+        also None — would silently no-op even though "is thinking..." is
+        already showing on that thread.  Targeting the same thread the
+        turn-start ``send_typing`` used keeps the live status updates aligned
+        with the indicator the user is actually looking at.
+        """
+        if not (metadata and (metadata.get("thread_id") or metadata.get("thread_ts"))):
+            ts = self._active_status_threads.get(chat_id)
+            if ts:
+                metadata = {"thread_id": ts}
+        await self.send_typing(chat_id, metadata=metadata, status=label)
 
     async def stop_typing(self, chat_id: str, metadata=None) -> None:
         """Clear the assistant thread status indicator."""

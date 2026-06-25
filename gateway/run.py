@@ -14403,7 +14403,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             platform=source.platform,
             require_platform_override_for={Platform.MATTERMOST},
         )
-        needs_progress_queue = tool_progress_enabled or _thinking_enabled
+        try:
+            status_line_enabled = _resolve_gateway_display_bool(
+                user_config,
+                platform_key,
+                "status_line_progress",
+                default=False,
+                platform=source.platform,
+            )
+        except Exception:
+            status_line_enabled = False
+        try:
+            _raw_labels = resolve_display_setting(
+                user_config, platform_key, "status_labels", {}
+            )
+            status_labels = _raw_labels if isinstance(_raw_labels, dict) else {}
+        except Exception:
+            status_labels = {}
+        try:
+            _raw_default = resolve_display_setting(
+                user_config,
+                platform_key,
+                "status_line_default",
+                "working on it…",
+            )
+            status_line_default = (
+                _raw_default
+                if isinstance(_raw_default, str) and _raw_default.strip()
+                else "working on it…"
+            )
+        except Exception:
+            status_line_default = "working on it…"
+        needs_progress_queue = (
+            tool_progress_enabled or _thinking_enabled or status_line_enabled
+        )
 
 
         # Queue for progress messages (thread-safe)
@@ -14526,6 +14559,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if msg:
                     progress_queue.put(msg)
                 return
+
+            # Slack-style native status line: when an adapter can render a live status
+            # line (assistant.threads.setStatus), update it with a SHORT, AUDIENCE-SAFE
+            # phrase per tool — never the raw tool name/args, which would leak internal
+            # tooling into board-facing channels. Phrases come only from operator config
+            # (status_labels) or the generic status_line_default. This runs independently
+            # of tool_progress: it is the clean, board-safe progress surface.
+            if event_type == "tool.started" and status_line_enabled:
+                try:
+                    _sl_adapter = self.adapters.get(source.platform)
+                    if getattr(_sl_adapter, "supports_status_line", False):
+                        _label = status_labels.get(tool_name) or status_line_default
+                        safe_schedule_threadsafe(
+                            _sl_adapter.update_thread_status(
+                                source.chat_id,
+                                _label,
+                                metadata=_status_thread_metadata,
+                            ),
+                            _loop_for_step,
+                            logger=logger,
+                            log_message="status-line update scheduling error",
+                        )
+                except Exception as _sl_err:
+                    logger.debug("status-line update failed: %s", _sl_err)
 
             # If tool_progress is off, only _thinking passes through (above).
             # Regular tool calls are suppressed.
@@ -15390,7 +15447,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
-            agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
+            agent.tool_progress_callback = (
+                progress_callback
+                if (tool_progress_enabled or status_line_enabled or _thinking_enabled)
+                else None
+            )
             # Discord voice verbal-ack hook (fires once per turn on first tool
             # call; armed only when in a voice channel with the mixer running).
             agent.tool_start_callback = (
