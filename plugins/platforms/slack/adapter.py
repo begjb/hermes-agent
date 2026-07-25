@@ -1570,7 +1570,7 @@ class SlackAdapter(BasePlatformAdapter):
             # Split long messages, preserving code block boundaries
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
-            thread_ts = self._resolve_thread_ts(reply_to, metadata)
+            thread_ts = self._resolve_thread_ts(reply_to, metadata, chat_id)
             last_result = None
 
             # reply_broadcast: also post thread replies to the main channel.
@@ -1634,7 +1634,7 @@ class SlackAdapter(BasePlatformAdapter):
 
         try:
             formatted = self.format_message(content)
-            thread_ts = self._resolve_thread_ts(reply_to, metadata)
+            thread_ts = self._resolve_thread_ts(reply_to, metadata, chat_id)
             kwargs = {
                 "channel": chat_id,
                 "user": user_id,
@@ -1792,10 +1792,35 @@ class SlackAdapter(BasePlatformAdapter):
             return True  # default: each DM thread is its own session
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
+    def _conversation_style_for(self, chat_id):
+        # concepts/conversation-style: per-channel reply style from a runtime file
+        # (HERMES_CONVERSATION_STYLES_FILE), mtime-cached. Returns 'thread' |
+        # 'top_level' | None (None => use the global reply_in_thread default).
+        import os, json
+        path = os.getenv("HERMES_CONVERSATION_STYLES_FILE")
+        if not path or not chat_id:
+            return None
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return None
+        cache = getattr(self, "_conv_style_cache", None)
+        if not cache or cache.get("mtime") != mtime:
+            try:
+                with open(path) as _fh:
+                    data = json.load(_fh)
+            except Exception:
+                data = {}
+            cache = {"mtime": mtime, "data": data if isinstance(data, dict) else {}}
+            self._conv_style_cache = cache
+        val = cache["data"].get(chat_id)
+        return val if val in ("thread", "top_level") else None
+
     def _resolve_thread_ts(
         self,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        chat_id: Optional[str] = None,
     ) -> Optional[str]:
         """Resolve the correct thread_ts for a Slack API call.
 
@@ -1816,7 +1841,13 @@ class SlackAdapter(BasePlatformAdapter):
         # top-level message. reply_to is the incoming message's own id, so
         # when thread_id == reply_to the "thread" is synthetic and we reply
         # directly in the channel instead.
-        if not self.config.extra.get("reply_in_thread", True):
+        _conv_override = self._conversation_style_for(chat_id)
+        _reply_in_thread = self.config.extra.get("reply_in_thread", True)
+        if _conv_override == "top_level":
+            _reply_in_thread = False
+        elif _conv_override == "thread":
+            _reply_in_thread = True
+        if not _reply_in_thread:
             md = metadata or {}
             existing_thread = md.get("thread_id") or md.get("thread_ts")
             if existing_thread and reply_to and existing_thread == reply_to:
@@ -1845,7 +1876,7 @@ class SlackAdapter(BasePlatformAdapter):
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        thread_ts = self._resolve_thread_ts(reply_to, metadata)
+        thread_ts = self._resolve_thread_ts(reply_to, metadata, chat_id)
         last_exc = None
         for attempt in range(3):
             try:
@@ -2336,7 +2367,7 @@ class SlackAdapter(BasePlatformAdapter):
                 response = await client.get(image_url)
                 response.raise_for_status()
 
-            thread_ts = self._resolve_thread_ts(reply_to, metadata)
+            thread_ts = self._resolve_thread_ts(reply_to, metadata, chat_id)
             result = await self._get_client(chat_id).files_upload_v2(
                 channel=chat_id,
                 content=response.content,
@@ -2409,7 +2440,7 @@ class SlackAdapter(BasePlatformAdapter):
             )
 
         try:
-            thread_ts = self._resolve_thread_ts(reply_to, metadata)
+            thread_ts = self._resolve_thread_ts(reply_to, metadata, chat_id)
             last_exc = None
             for attempt in range(3):
                 try:
@@ -2466,7 +2497,7 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"File not found: {file_path}")
 
         display_name = file_name or os.path.basename(file_path)
-        thread_ts = self._resolve_thread_ts(reply_to, metadata)
+        thread_ts = self._resolve_thread_ts(reply_to, metadata, chat_id)
 
         try:
             last_exc = None
