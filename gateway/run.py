@@ -4495,6 +4495,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else "Your current task will be interrupted."
         )
         msg = f"⚠️ Gateway {action} — {hint}"
+        # ATHENA-SHUTDOWN-NOTICE-PATCH:BEGIN (scripts/patch-hermes-shutdown-notice.sh)
+        # Redirect the restart/shutdown notice to ONE operator channel (e.g.
+        # #athena-monitoring) instead of active board/working sessions + the home
+        # channel. See scripts/patch-hermes-shutdown-notice.sh for the full why.
+        if os.getenv("HERMES_SUPPRESS_SHUTDOWN_NOTICE") == "1":
+            return
+        _athena_notice_channel = os.getenv("HERMES_SHUTDOWN_NOTICE_CHANNEL")
+        if _athena_notice_channel:
+            _athena_adapter = self.adapters.get(Platform.SLACK)
+            if _athena_adapter is not None:
+                try:
+                    _athena_result = await _athena_adapter.send(_athena_notice_channel, msg)
+                    if _athena_result is not None and getattr(_athena_result, "success", True) is False:
+                        logger.debug("Failed to send shutdown notification to redirect channel slack:%s: %s", _athena_notice_channel, getattr(_athena_result, "error", "send returned success=False"))
+                    else:
+                        logger.info("Sent shutdown notification to redirect channel slack:%s", _athena_notice_channel)
+                except Exception as _athena_exc:
+                    logger.debug("Failed to send shutdown notification to redirect channel slack:%s: %s", _athena_notice_channel, _athena_exc)
+            return
+        # ATHENA-SHUTDOWN-NOTICE-PATCH:END
 
         notified: set[tuple[str, str, Optional[str]]] = set()
         for session_key in active:
