@@ -1077,7 +1077,7 @@ class TestBuildAnthropicKwargs:
     def test_fast_mode_oauth_default_omits_context_1m_beta(self):
         """Default OAuth fast-mode avoids context-1m for subscriptions without it."""
         kwargs = build_anthropic_kwargs(
-            model="claude-opus-4-6",
+            model="claude-opus-5",
             messages=[{"role": "user", "content": "Hi"}],
             tools=None,
             max_tokens=4096,
@@ -1094,7 +1094,7 @@ class TestBuildAnthropicKwargs:
         """drop_context_1m_beta=True strips context-1m from fast-mode
         extra_headers while preserving every other OAuth + fast-mode beta."""
         kwargs = build_anthropic_kwargs(
-            model="claude-opus-4-6",
+            model="claude-opus-5",
             messages=[{"role": "user", "content": "Hi"}],
             tools=None,
             max_tokens=4096,
@@ -1204,21 +1204,38 @@ class TestBuildAnthropicKwargs:
         assert _forbids_sampling_params("claude-sonnet-4-5") is False
 
     def test_supports_fast_mode_predicate(self):
-        """Fast mode is Opus 4.6 only — Opus 4.7 and others must be excluded.
+        """Fast mode is Claude Opus 5 and Opus 4.8 — everything else excluded.
 
-        For Opus 4.8 the fast variant is a separate model ID
-        (anthropic/claude-opus-4.8-fast) routed through the normal model
-        field, NOT via the ``speed: "fast"`` request parameter. So
-        ``_supports_fast_mode`` (which gates the parameter) must stay
-        False for both opus-4-8 and opus-4-8-fast.
+        This test previously asserted the opposite (4.6 True, 4.8 False) on the
+        premise that "for Opus 4.8 the fast variant is a separate model ID
+        routed through the normal model field, NOT via the speed parameter".
+        That was backwards, and it is why the stale gate survived review:
+
+          * Opus 5 / Opus 4.8 use the ``speed: "fast"`` REQUEST PARAMETER
+            (with the fast-mode beta) — which is exactly what this predicate
+            gates, so they must be True.
+          * The separate ``-fast`` MODEL ID is the *retired* Opus 4.6 form. It
+            no longer enables anything: the API silently serves standard Opus
+            4.6. Gating it True bought nothing.
+          * Opus 4.7 fast mode was removed outright and 400s on ``speed``.
         """
         from agent.anthropic_adapter import _supports_fast_mode
-        assert _supports_fast_mode("claude-opus-4-6") is True
-        assert _supports_fast_mode("anthropic/claude-opus-4-6") is True
+        # Supported — the speed-parameter models.
+        assert _supports_fast_mode("claude-opus-5") is True
+        assert _supports_fast_mode("anthropic/claude-opus-5") is True
+        assert _supports_fast_mode("claude-opus-4-8") is True
+        assert _supports_fast_mode("claude-opus-4.8") is True
+        # Case-insensitive: the raw-string compare this replaces missed these.
+        assert _supports_fast_mode("Claude-Opus-5") is True
+        assert _supports_fast_mode("anthropic/Claude-Opus-4-8") is True
+        # Removed (4.7 400s) and retired (4.6's -fast id silently degrades).
         assert _supports_fast_mode("claude-opus-4-7") is False
-        assert _supports_fast_mode("claude-opus-4-8") is False
-        assert _supports_fast_mode("claude-opus-4-8-fast") is False
+        assert _supports_fast_mode("claude-opus-4-6") is False
+        assert _supports_fast_mode("claude-opus-4-6-fast") is False
+        # Must not false-positive: "opus-5" is not a substring of "opus-4-5".
+        assert _supports_fast_mode("claude-opus-4-5") is False
         assert _supports_fast_mode("claude-sonnet-4-6") is False
+        assert _supports_fast_mode("claude-sonnet-5") is False
         assert _supports_fast_mode("claude-haiku-4-5") is False
         assert _supports_fast_mode("") is False
 
@@ -1305,10 +1322,16 @@ class TestBuildAnthropicKwargs:
         beta_header = (kwargs.get("extra_headers") or {}).get("anthropic-beta", "")
         assert "fast-mode-2026-02-01" not in beta_header
 
-    def test_fast_mode_still_applied_on_opus_46(self):
-        """Regression guard — fast mode must still work on Opus 4.6."""
+    def test_fast_mode_applied_end_to_end_on_supported_model(self):
+        """Regression guard — the speed parameter AND the fast-mode beta must
+        travel together on a supported model. Sending one without the other is
+        rejected by the API, so asserting both is the point of this test.
+
+        Was named ..._on_opus_46 and pinned to Opus 4.6, whose fast variant is
+        a retired separate model id rather than this speed parameter.
+        """
         kwargs = build_anthropic_kwargs(
-            model="claude-opus-4-6",
+            model="claude-opus-5",
             messages=[{"role": "user", "content": "hi"}],
             tools=None,
             max_tokens=1024,

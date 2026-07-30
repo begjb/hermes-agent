@@ -117,7 +117,24 @@ def _is_claude_model(model: str | None) -> bool:
     return "claude" in (model or "").lower()
 
 
-_FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-6", "opus-4.6")
+# Models supporting Anthropic Fast Mode via the ``speed: "fast"`` REQUEST
+# PARAMETER: Claude Opus 5 and Opus 4.8.
+#
+# THIS IS AN ALLOWLIST AND IT WILL GO STALE — it already did. It read
+# ("opus-4-6", "opus-4.6") long after Opus 4.6 fast mode was retired, so the
+# gate permitted the one model where fast mode silently does nothing and
+# blocked both models where it works. Default-deny is deliberate (an
+# unsupported model 400s on ``speed``), which makes staleness fail *quietly*
+# — re-check this on every Claude release. Contrast
+# _LEGACY_MANUAL_THINKING_CLAUDE_SUBSTRINGS above, which is a DENYLIST
+# specifically so it needs no per-release edit; fast mode can't use that shape
+# because it is a research preview on named models, not a general contract.
+#
+# Matched case-insensitively (see _supports_fast_mode). Both dotted and
+# hyphenated spellings are listed because the model id is not dot-normalized
+# here. "opus-5" cannot false-positive on "claude-opus-4-5" — that string
+# contains "opus-4-5", and "opus-" is followed by "4", not "5".
+_FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-5", "opus-4-8", "opus-4.8")
 
 # ── Max output token limits per Anthropic model ───────────────────────
 # Source: Anthropic docs + Cline model catalog.  Anthropic's API requires
@@ -292,12 +309,22 @@ def _forbids_sampling_params(model: str) -> bool:
 def _supports_fast_mode(model: str) -> bool:
     """Return True for models that support Anthropic Fast Mode (speed=fast).
 
-    Per Anthropic docs, fast mode is currently supported on Opus 4.6 only.
-    Sending ``speed: "fast"`` to any other Claude model (including Opus 4.7)
-    returns HTTP 400. This guard prevents silently 400'ing when stale config
-    or older callers leave fast mode enabled across a model upgrade.
+    Fast mode is a research preview on Claude Opus 5 and Opus 4.8, requested
+    with ``speed: "fast"`` **plus** the fast-mode beta — the call site sends
+    both together, and the parameter alone is rejected.
+
+    Two things this guard previously got backwards:
+      * Opus 4.7 fast mode was REMOVED; ``speed: "fast"`` 400s there.
+      * Opus 4.6's fast variant was a separate ``-fast`` MODEL ID, since
+        retired — that id now silently falls back to standard Opus 4.6, so
+        allowing 4.6 through this parameter gate bought nothing.
+
+    The model id is lowercased before matching, consistent with
+    _supports_xhigh_effort and _get_anthropic_max_output. The raw-string
+    compare this replaces silently missed any id carrying uppercase
+    (e.g. "anthropic/Claude-Opus-5").
     """
-    return any(v in model for v in _FAST_MODE_SUPPORTED_SUBSTRINGS)
+    return any(v in model.lower() for v in _FAST_MODE_SUPPORTED_SUBSTRINGS)
 
 
 # Beta headers for enhanced features that are safe on ordinary/native Anthropic
@@ -2471,10 +2498,12 @@ def build_anthropic_kwargs(
         for _sampling_key in ("temperature", "top_p", "top_k"):
             kwargs.pop(_sampling_key, None)
 
-    # ── Fast mode (Opus 4.6 only) ────────────────────────────────────
-    # Adds extra_body.speed="fast" + the fast-mode beta header for ~2.5x
-    # output speed. Per Anthropic docs, fast mode is only supported on
-    # Opus 4.6 — Opus 4.7 and other models 400 on the speed parameter.
+    # ── Fast mode (Claude Opus 5 / Opus 4.8) ─────────────────────────
+    # Adds extra_body.speed="fast" + the fast-mode beta header for up to
+    # ~2.5x output tokens/sec at premium pricing. BOTH parts are required —
+    # the speed parameter without the beta is rejected. Opus 4.7 400s on
+    # `speed` (fast mode removed there); Opus 4.6's separate `-fast` model id
+    # is retired and silently degrades to standard.
     # Only for native Anthropic endpoints — third-party providers would
     # reject the unknown beta header and speed parameter.
     if (
