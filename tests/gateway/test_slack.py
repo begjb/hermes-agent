@@ -3820,3 +3820,111 @@ class TestSlashEphemeralAck:
         # the normal single-user case; the ContextVar path is the precise one.
         # The key invariant is: when the ContextVar IS set, it matches exactly.
         assert ctx is not None  # fallback path finds the entry
+
+
+# ---------------------------------------------------------------------------
+# TestPollingFallbackReplyGate
+# ---------------------------------------------------------------------------
+
+
+class TestPollingFallbackReplyGate:
+    """The polling fallback must catch fresh replies in threads rooted far up
+    the channel (wide history scan) without fetching replies for every stale
+    thread (the `latest_reply` gate)."""
+
+    def _arm(self, adapter):
+        import time
+
+        client = adapter._app.client
+        adapter._team_clients = {"T1": client}
+        adapter._handle_slack_message = AsyncMock()
+        adapter.config.extra["poll_lookback_seconds"] = 900
+        adapter._poll_started_at = 0.0
+        return client, time.time()
+
+    @pytest.mark.asyncio
+    async def test_hot_old_thread_caught_stale_thread_skipped(self, adapter):
+        client, now = self._arm(adapter)
+
+        hot_root_ts = f"{now - 3600:.6f}"  # rooted well before the lookback window
+        fresh_reply_ts = f"{now - 60:.6f}"
+        stale_root_ts = f"{now - 7200:.6f}"
+        client.conversations_history.return_value = {
+            "messages": [
+                {"ts": hot_root_ts, "reply_count": 2, "latest_reply": fresh_reply_ts},
+                {
+                    "ts": stale_root_ts,
+                    "reply_count": 5,
+                    "latest_reply": f"{now - 3000:.6f}",
+                },
+            ]
+        }
+        client.conversations_replies.return_value = {
+            "messages": [
+                {"ts": hot_root_ts, "thread_ts": hot_root_ts, "user": "U_EA"},
+                {"ts": fresh_reply_ts, "thread_ts": hot_root_ts, "user": "U_EA"},
+            ]
+        }
+
+        await adapter._poll_slack_channel("C123")
+
+        # One wide history call instead of a shallow page of 30.
+        assert client.conversations_history.await_args.kwargs["limit"] == 200
+        # Replies fetched only for the thread with fresh activity.
+        assert client.conversations_replies.await_count == 1
+        assert client.conversations_replies.await_args.kwargs["ts"] == hot_root_ts
+        # Only the in-window reply is dispatched; both roots predate the window.
+        dispatched = [
+            c.args[0]["ts"] for c in adapter._handle_slack_message.await_args_list
+        ]
+        assert dispatched == [fresh_reply_ts]
+
+    @pytest.mark.asyncio
+    async def test_missing_or_bad_latest_reply_still_fetches(self, adapter):
+        client, now = self._arm(adapter)
+
+        no_stamp_ts = f"{now - 3600:.6f}"
+        bad_stamp_ts = f"{now - 3700:.6f}"
+        fresh_reply_ts = f"{now - 30:.6f}"
+        client.conversations_history.return_value = {
+            "messages": [
+                {"ts": no_stamp_ts, "reply_count": 1},
+                {"ts": bad_stamp_ts, "reply_count": 1, "latest_reply": "not-a-ts"},
+            ]
+        }
+        client.conversations_replies.return_value = {
+            "messages": [
+                {"ts": fresh_reply_ts, "thread_ts": no_stamp_ts, "user": "U_EA"},
+            ]
+        }
+
+        await adapter._poll_slack_channel("C123")
+
+        # Without a usable stamp the gate must fail open (fetch), never
+        # silently skip a possibly-hot thread.
+        fetched = {
+            c.kwargs["ts"] for c in client.conversations_replies.await_args_list
+        }
+        assert fetched == {no_stamp_ts, bad_stamp_ts}
+
+    @pytest.mark.asyncio
+    async def test_poll_seen_dedup_across_cycles(self, adapter):
+        client, now = self._arm(adapter)
+
+        root_ts = f"{now - 3600:.6f}"
+        fresh_reply_ts = f"{now - 60:.6f}"
+        client.conversations_history.return_value = {
+            "messages": [
+                {"ts": root_ts, "reply_count": 1, "latest_reply": fresh_reply_ts},
+            ]
+        }
+        client.conversations_replies.return_value = {
+            "messages": [
+                {"ts": fresh_reply_ts, "thread_ts": root_ts, "user": "U_EA"},
+            ]
+        }
+
+        await adapter._poll_slack_channel("C123")
+        await adapter._poll_slack_channel("C123")
+
+        assert adapter._handle_slack_message.await_count == 1
