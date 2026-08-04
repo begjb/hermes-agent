@@ -2132,7 +2132,7 @@ class SlackAdapter(BasePlatformAdapter):
         cache = getattr(self, "_conv_style_cache", None)
         if not cache or cache.get("mtime") != mtime:
             try:
-                with open(path) as _fh:
+                with open(path, encoding="utf-8") as _fh:
                     data = json.load(_fh)
             except Exception:
                 data = {}
