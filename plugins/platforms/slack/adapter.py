@@ -1446,10 +1446,14 @@ class SlackAdapter(BasePlatformAdapter):
             team_id = next(iter(self._team_clients.keys()))
             self._channel_team[channel_id] = team_id
 
-        history = await client.conversations_history(channel=channel_id, limit=30)
+        # Scan a wide slice of roots in one API call; the `latest_reply` gate
+        # below keeps the per-root conversations.replies cost bounded, so a
+        # thread rooted far up a busy channel still gets its fresh replies.
+        history = await client.conversations_history(channel=channel_id, limit=200)
         messages_by_ts: Dict[str, Dict[str, Any]] = {}
         roots = history.get("messages", []) if hasattr(history, "get") else []
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+        oldest = max(time.time() - self._slack_poll_lookback(), self._poll_started_at)
 
         def _remember_bot_thread(message: Dict[str, Any], root_ts: str = "") -> None:
             """Remember threads where this bot has already participated."""
@@ -1485,6 +1489,17 @@ class SlackAdapter(BasePlatformAdapter):
             if not root_ts or not root.get("reply_count"):
                 continue
 
+            # Slack stamps `latest_reply` on every thread parent, so a stale
+            # thread costs no conversations.replies call; a missing or
+            # unparseable stamp falls back to fetching.
+            latest_reply = str(root.get("latest_reply", "") or "")
+            if latest_reply:
+                try:
+                    if float(latest_reply) < oldest:
+                        continue
+                except ValueError:
+                    pass
+
             try:
                 replies = await client.conversations_replies(
                     channel=channel_id,
@@ -1501,7 +1516,6 @@ class SlackAdapter(BasePlatformAdapter):
                     messages_by_ts[reply_ts] = dict(reply)
                     _remember_bot_thread(reply, root_ts)
 
-        oldest = max(time.time() - self._slack_poll_lookback(), self._poll_started_at)
         for ts, event in sorted(messages_by_ts.items(), key=lambda item: float(item[0])):
             try:
                 ts_value = float(ts)
