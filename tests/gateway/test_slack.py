@@ -665,6 +665,385 @@ class TestSlackSocketWatchdog:
 
 
 # ---------------------------------------------------------------------------
+# TestSlackSocketStopHardening — regression coverage for 2026-08-04
+# ---------------------------------------------------------------------------
+
+
+class TestSlackSocketStopHardening:
+    """Regression coverage for the 2026-08-04 deaf-socket incident.
+
+    Three production defects: (1) ``close_async()`` left an orphaned
+    slack_sdk ``connect()`` retry loop spinning against the closed session
+    ("Session is closed; Retrying..." every 10s); (2) an unbounded await in
+    the stop path silenced the 15s watchdog for ~9 hours; (3) sessions that
+    "established" but delivered no events kept ``is_connected`` True, so the
+    watchdog never fired while every message arrived via polling fallback.
+    """
+
+    # Reuse the watchdog harness helpers.
+    _make_fake_handler_factory = TestSlackSocketWatchdog._make_fake_handler_factory
+    _patch_stack = TestSlackSocketWatchdog._patch_stack
+    _drain = TestSlackSocketWatchdog._drain
+
+    @pytest.mark.asyncio
+    async def test_stop_cancels_orphaned_client_connect_loop(self):
+        """Defect 1: tasks still bound to the old client must be cancelled."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_stop_timeout_s = 0.5
+
+        class FakeClient:
+            def __init__(self):
+                self.message_processor = None
+                self.current_session_monitor = None
+                self.message_receiver = None
+
+            async def connect(self):
+                # Mirrors slack_sdk's connect(): bare retry loop, no
+                # ``self.closed`` check — close() cannot stop it.
+                while True:
+                    await asyncio.sleep(0.01)
+
+        client = FakeClient()
+        zombie = asyncio.create_task(client.connect())
+
+        async def _receiver():
+            await asyncio.Event().wait()
+
+        client.message_receiver = asyncio.create_task(_receiver())
+
+        class FakeHandler:
+            def __init__(self, c):
+                self.client = c
+
+            async def close_async(self):
+                pass
+
+        adapter._handler = FakeHandler(client)
+        adapter._socket_mode_task = None
+
+        await adapter._stop_socket_mode_handler()
+
+        assert zombie.cancelled(), "orphaned connect() loop survived the stop"
+        assert client.message_receiver.cancelled()
+        assert adapter._handler is None
+
+    @pytest.mark.asyncio
+    async def test_stop_sweep_spares_live_dispatch(self):
+        """The sweep must kill reconnect loops but never in-flight dispatch.
+
+        Cancelling a live ``run_message_listeners`` task would abort a
+        message that dedup already recorded — Slack's redelivery would then
+        be dropped and the message lost.
+        """
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_stop_timeout_s = 0.5
+
+        class FakeClient:
+            message_processor = None
+            current_session_monitor = None
+            message_receiver = None
+
+            async def connect(self):
+                while True:
+                    await asyncio.sleep(0.01)
+
+            async def connect_to_new_endpoint(self, force=False):
+                await self.connect()
+
+            async def run_message_listeners(self, message, raw):
+                if message.get("type") == "disconnect":
+                    # The 2026-08-04 zombie shape: an untracked listener
+                    # future descending into the reconnect machinery.
+                    await self.connect_to_new_endpoint(force=True)
+                else:
+                    await asyncio.Event().wait()  # live dispatch in flight
+
+        client = FakeClient()
+        live = asyncio.create_task(
+            client.run_message_listeners({"type": "events_api"}, "")
+        )
+        zombie = asyncio.create_task(
+            client.run_message_listeners({"type": "disconnect"}, "")
+        )
+        for _ in range(5):  # let both descend into their awaits
+            await asyncio.sleep(0)
+
+        class FakeHandler:
+            def __init__(self, c):
+                self.client = c
+
+            async def close_async(self):
+                pass
+
+        adapter._handler = FakeHandler(client)
+        adapter._socket_mode_task = None
+
+        await adapter._stop_socket_mode_handler()
+
+        assert zombie.cancelled(), "nested reconnect loop survived the sweep"
+        assert not live.done(), "live dispatch task was wrongly cancelled"
+        live.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await live
+
+    @pytest.mark.asyncio
+    async def test_stop_survives_hung_close(self):
+        """Defect 2: a hung close_async() must not block the stop path."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_stop_timeout_s = 0.05
+
+        class HungHandler:
+            def __init__(self):
+                self.client = MagicMock()
+
+            async def close_async(self):
+                await asyncio.Event().wait()  # never set — the ~9h hang
+
+        adapter._handler = HungHandler()
+        adapter._socket_mode_task = None
+
+        # Must return promptly instead of hanging forever.
+        await asyncio.wait_for(adapter._stop_socket_mode_handler(), timeout=2.0)
+        assert adapter._handler is None
+
+    @pytest.mark.asyncio
+    async def test_stop_survives_uncancellable_close(self):
+        """Defect 2, worst case: close swallows CancelledError.
+
+        ``asyncio.wait_for`` would wait for the cancellation to complete and
+        hang anyway; the stop path must cancel-and-ABANDON instead.
+        """
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_stop_timeout_s = 0.05
+        release = asyncio.Event()
+
+        class StubbornHandler:
+            def __init__(self):
+                self.client = MagicMock()
+
+            async def close_async(self):
+                while True:
+                    try:
+                        await release.wait()
+                        return
+                    except asyncio.CancelledError:
+                        continue  # refuses to die
+
+        adapter._handler = StubbornHandler()
+        adapter._socket_mode_task = None
+
+        await asyncio.wait_for(adapter._stop_socket_mode_handler(), timeout=2.0)
+        assert adapter._handler is None
+
+        # Let the abandoned close finish so the loop tears down clean.
+        release.set()
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_queued_restart_coalesces_after_completed_restart(self):
+        """A restart queued behind another must not redo the finished work."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 9999
+        factory, instances = self._make_fake_handler_factory()
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(factory):
+                stack.enter_context(p)
+
+            try:
+                assert await adapter.connect() is True
+                baseline = len(instances)
+
+                await asyncio.gather(
+                    adapter._restart_socket_mode("watchdog"),
+                    adapter._restart_socket_mode("done-callback"),
+                )
+
+                assert len(instances) - baseline == 1, (
+                    "queued restart tore down the freshly started handler"
+                )
+            finally:
+                await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_restart_survives_hung_close_and_starts_fresh(self):
+        """Defect 2: a hung close during restart still yields a new handler."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 9999
+        adapter._socket_stop_timeout_s = 0.05
+        factory, instances = self._make_fake_handler_factory()
+
+        # First handler's close hangs forever, like the 2026-08-04 close.
+        orig_close = factory.close_async
+
+        async def hung_close(handler_self):
+            if handler_self is instances[0]:
+                await asyncio.Event().wait()
+            await orig_close(handler_self)
+
+        factory.close_async = hung_close
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(factory):
+                stack.enter_context(p)
+
+            try:
+                assert await adapter.connect() is True
+                assert len(instances) == 1
+
+                await asyncio.wait_for(
+                    adapter._restart_socket_mode("test: hung close"), timeout=2.0
+                )
+
+                assert len(instances) == 2, "restart did not start a fresh handler"
+                assert adapter._handler is instances[-1]
+            finally:
+                factory.close_async = orig_close
+                await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_poll_dispatch_win_streak_counts_and_resets(self, adapter):
+        """Defect 3: poll wins accumulate; any socket delivery resets."""
+        evt = {
+            "text": "hello",
+            "user": "U_USER",
+            "channel": "D123",
+            "channel_type": "im",
+            "ts": "1000000000.000001",
+        }
+
+        await adapter._handle_slack_message(dict(evt), origin="poll")
+        assert adapter._poll_dispatch_win_streak == 1
+
+        await adapter._handle_slack_message(
+            dict(evt, ts="1000000000.000002"), origin="poll"
+        )
+        assert adapter._poll_dispatch_win_streak == 2
+
+        # A socket delivery resets the streak even when it's a duplicate the
+        # dedup drops (the socket lost the race but is clearly not deaf).
+        await adapter._handle_slack_message(dict(evt), origin="socket")
+        assert adapter._poll_dispatch_win_streak == 0
+
+        # Bot messages are filtered before the counting point — the polling
+        # fallback dispatching them must not look like a win.
+        await adapter._handle_slack_message(
+            dict(evt, ts="1000000000.000003", bot_id="B1"), origin="poll"
+        )
+        assert adapter._poll_dispatch_win_streak == 0
+
+    @pytest.mark.asyncio
+    async def test_watchdog_restarts_deaf_socket(self):
+        """Defect 3: is_connected=True + persistent poll wins → restart."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 0.01
+        factory, instances = self._make_fake_handler_factory()
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(factory):
+                stack.enter_context(p)
+
+            try:
+                assert await adapter.connect() is True
+                assert len(instances) == 1
+
+                # The fake transport reports connected — the deaf-socket trap.
+                adapter._poll_dispatch_win_streak = 3
+
+                for _ in range(40):
+                    if len(instances) >= 2:
+                        break
+                    await asyncio.sleep(0.01)
+
+                assert len(instances) >= 2, "watchdog ignored the deaf socket"
+                assert instances[0].closed is True
+                assert adapter._poll_dispatch_win_streak == 0
+            finally:
+                await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_deaf_socket_detection_can_be_disabled(self):
+        """deaf_socket_poll_wins=0 disables the deaf-socket restart."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        config.extra["deaf_socket_poll_wins"] = 0
+        adapter = SlackAdapter(config)
+        adapter._socket_watchdog_interval_s = 0.01
+        factory, instances = self._make_fake_handler_factory()
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(factory):
+                stack.enter_context(p)
+
+            try:
+                assert await adapter.connect() is True
+                adapter._poll_dispatch_win_streak = 50
+
+                await asyncio.sleep(0.1)
+
+                assert len(instances) == 1, "disabled detection still restarted"
+            finally:
+                await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_deaf_socket_restart_respects_cooldown(self):
+        """A deaf-restart storm is capped by the cooldown."""
+        import time as _time
+
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 0.01
+        factory, instances = self._make_fake_handler_factory()
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(factory):
+                stack.enter_context(p)
+
+            try:
+                assert await adapter.connect() is True
+                adapter._deaf_socket_restart_at = _time.monotonic()
+                adapter._poll_dispatch_win_streak = 3
+
+                await asyncio.sleep(0.1)
+
+                assert len(instances) == 1, "cooldown did not hold back restart"
+            finally:
+                await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_socket_envelope_listener_resets_streak(self):
+        """Any envelope over the socket proves delivery and resets the streak."""
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 9999
+        factory, instances = self._make_fake_handler_factory()
+
+        # Give the fake client a real listener list so the adapter's
+        # deaf-socket hook actually lands somewhere inspectable.
+        orig_init = factory.__init__
+
+        def init_with_listeners(handler_self, app, app_token, proxy=None):
+            orig_init(handler_self, app, app_token, proxy=proxy)
+            handler_self.client.message_listeners = []
+
+        factory.__init__ = init_with_listeners
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(factory):
+                stack.enter_context(p)
+
+            try:
+                assert await adapter.connect() is True
+                listeners = instances[0].client.message_listeners
+                assert len(listeners) == 1, "envelope hook was not registered"
+
+                adapter._poll_dispatch_win_streak = 2
+                await listeners[0](instances[0].client, {"type": "hello"}, None)
+                assert adapter._poll_dispatch_win_streak == 0
+            finally:
+                factory.__init__ = orig_init
+                await adapter.disconnect()
+
+
+# ---------------------------------------------------------------------------
 # TestSlackProxyBehavior
 # ---------------------------------------------------------------------------
 
