@@ -1500,12 +1500,23 @@ class SlackAdapter(BasePlatformAdapter):
                 except ValueError:
                     pass
 
+            # A single page from the thread start covers the parent plus 49
+            # replies; longer threads would silently drop their newest
+            # replies, so aim the fetch at the poll window instead.
+            replies_kwargs: Dict[str, Any] = {
+                "channel": channel_id,
+                "ts": root_ts,
+                "limit": 50,
+            }
             try:
-                replies = await client.conversations_replies(
-                    channel=channel_id,
-                    ts=root_ts,
-                    limit=50,
-                )
+                reply_count = int(root.get("reply_count") or 0)
+            except (TypeError, ValueError):
+                reply_count = 0
+            if reply_count > 49:
+                replies_kwargs["oldest"] = f"{oldest:.6f}"
+
+            try:
+                replies = await client.conversations_replies(**replies_kwargs)
             except Exception as e:  # pragma: no cover - defensive logging
                 logger.debug("[Slack] Polling fallback could not read replies for %s/%s: %s", channel_id, root_ts, e)
                 continue
@@ -1516,7 +1527,14 @@ class SlackAdapter(BasePlatformAdapter):
                     messages_by_ts[reply_ts] = dict(reply)
                     _remember_bot_thread(reply, root_ts)
 
-        for ts, event in sorted(messages_by_ts.items(), key=lambda item: float(item[0])):
+        def _dispatch_order(item: tuple) -> float:
+            # A single malformed ts must not abort the whole cycle's dispatch.
+            try:
+                return float(item[0])
+            except ValueError:
+                return 0.0
+
+        for ts, event in sorted(messages_by_ts.items(), key=_dispatch_order):
             try:
                 ts_value = float(ts)
             except ValueError:

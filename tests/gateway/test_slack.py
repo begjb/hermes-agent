@@ -3873,6 +3873,8 @@ class TestPollingFallbackReplyGate:
         # Replies fetched only for the thread with fresh activity.
         assert client.conversations_replies.await_count == 1
         assert client.conversations_replies.await_args.kwargs["ts"] == hot_root_ts
+        # Short thread: one page from the start covers it, no window targeting.
+        assert "oldest" not in client.conversations_replies.await_args.kwargs
         # Only the in-window reply is dispatched; both roots predate the window.
         dispatched = [
             c.args[0]["ts"] for c in adapter._handle_slack_message.await_args_list
@@ -3928,3 +3930,51 @@ class TestPollingFallbackReplyGate:
         await adapter._poll_slack_channel("C123")
 
         assert adapter._handle_slack_message.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_long_thread_fetch_targets_the_window(self, adapter):
+        client, now = self._arm(adapter)
+
+        root_ts = f"{now - 86400:.6f}"
+        fresh_reply_ts = f"{now - 45:.6f}"
+        client.conversations_history.return_value = {
+            "messages": [
+                {"ts": root_ts, "reply_count": 80, "latest_reply": fresh_reply_ts},
+            ]
+        }
+        client.conversations_replies.return_value = {
+            "messages": [
+                {"ts": fresh_reply_ts, "thread_ts": root_ts, "user": "U_EA"},
+            ]
+        }
+
+        await adapter._poll_slack_channel("C123")
+
+        # One page from the thread start can't reach reply 80 — the fetch
+        # must aim at the poll window instead.
+        kwargs = client.conversations_replies.await_args.kwargs
+        assert kwargs["ts"] == root_ts
+        assert float(kwargs["oldest"]) < now - 45
+        dispatched = [
+            c.args[0]["ts"] for c in adapter._handle_slack_message.await_args_list
+        ]
+        assert dispatched == [fresh_reply_ts]
+
+    @pytest.mark.asyncio
+    async def test_malformed_ts_does_not_abort_dispatch(self, adapter):
+        client, now = self._arm(adapter)
+
+        good_ts = f"{now - 10:.6f}"
+        client.conversations_history.return_value = {
+            "messages": [
+                {"ts": "not-a-ts"},
+                {"ts": good_ts, "user": "U_EA", "text": "hello"},
+            ]
+        }
+
+        await adapter._poll_slack_channel("C123")
+
+        dispatched = [
+            c.args[0]["ts"] for c in adapter._handle_slack_message.await_args_list
+        ]
+        assert dispatched == [good_ts]
