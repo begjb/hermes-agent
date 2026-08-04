@@ -398,6 +398,23 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+        # Upper bound for each await in the Socket Mode stop path. The stop
+        # path runs inside the watchdog loop, so any unbounded await here can
+        # freeze self-healing entirely (observed 2026-08-04: ~9h of watchdog
+        # silence while a close hung).
+        self._socket_stop_timeout_s = 20.0
+        # Deaf-socket detection: how many consecutive inbound messages the
+        # polling fallback delivered first while the socket claimed to be
+        # connected. ``is_connected`` stays True for a session that delivers
+        # no events, so this is the only signal that catches it.
+        self._poll_dispatch_win_streak = 0
+        # ``None`` = never restarted for deafness. (A plain 0.0 would wedge
+        # the first restart behind the cooldown on hosts whose monotonic
+        # clock starts near zero, e.g. right after boot.)
+        self._deaf_socket_restart_at: Optional[float] = None
+        # Bumped after every successful in-place restart so a request that
+        # queued behind the reconnect lock can tell its work was already done.
+        self._socket_restart_generation = 0
 
     def _start_socket_mode_handler(self) -> None:
         """Start the Slack Socket Mode background task."""
@@ -409,37 +426,66 @@ class SlackAdapter(BasePlatformAdapter):
         )
         _apply_slack_proxy(self._handler.client, self._proxy_url)
 
+        # Feed deaf-socket detection: any envelope arriving over the socket
+        # proves the session can deliver events. slack_sdk wraps each
+        # listener call in its own try/except, so this hook can never break
+        # dispatch; ``*_args`` keeps it immune to listener-signature drift
+        # across slack_sdk versions (currently ``(client, message, raw)``).
+        listeners = getattr(self._handler.client, "message_listeners", None)
+        if listeners is not None:
+            async def _note_envelope(*_args: Any) -> None:
+                self._note_socket_delivery()
+
+            listeners.append(_note_envelope)
+
         task = asyncio.create_task(self._handler.start_async())
         self._socket_mode_task = task
         task.add_done_callback(self._on_socket_mode_task_done)
 
     async def _stop_socket_mode_handler(self) -> None:
-        """Stop Socket Mode handler and task."""
+        """Stop Socket Mode handler and task.
+
+        Every await here is bounded. This runs inside the watchdog loop, and
+        an unbounded await (e.g. a hung ``close_async()``) would silence the
+        watchdog itself — on 2026-08-04 that disabled self-healing for ~9h.
+        """
         handler = self._handler
         task = self._socket_mode_task
         self._handler = None
         self._socket_mode_task = None
 
         if handler is not None:
-            try:
-                await handler.close_async()
-            except Exception as e:  # pragma: no cover - defensive logging
-                logger.warning(
-                    "[Slack] Error while closing Socket Mode handler: %s",
-                    e,
-                    exc_info=True,
-                )
+            await self._await_bounded(
+                "Socket Mode handler close",
+                handler.close_async(),
+                self._socket_stop_timeout_s,
+            )
 
         if task is not None and not task.done():
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception:  # pragma: no cover - defensive logging
-                logger.debug(
-                    "[Slack] Socket Mode task failed while stopping", exc_info=True
+            # ``asyncio.wait`` (not ``wait_for``): it neither re-raises the
+            # task's CancelledError nor cancels anything else on timeout.
+            done, pending = await asyncio.wait(
+                {task}, timeout=self._socket_stop_timeout_s
+            )
+            if pending:
+                logger.warning(
+                    "[Slack] Socket Mode task did not stop within %.0fs; "
+                    "abandoning it",
+                    self._socket_stop_timeout_s,
                 )
+            elif not task.cancelled() and task.exception() is not None:
+                logger.debug(
+                    "[Slack] Socket Mode task failed while stopping: %s",
+                    task.exception(),
+                )
+
+        # slack_sdk's ``close()`` cancels only the tasks it tracks; hunt down
+        # anything else still running on the old client (see
+        # ``_cancel_socket_client_tasks``) so no orphaned reconnect loop
+        # survives the stop.
+        if handler is not None:
+            await self._cancel_socket_client_tasks(getattr(handler, "client", None))
 
     async def _socket_transport_connected(self) -> Optional[bool]:
         """Best-effort check of current Socket Mode transport state."""
@@ -462,24 +508,216 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return None
 
+    @staticmethod
+    def _consume_task_result(task: "asyncio.Task") -> None:
+        """Retrieve an abandoned task's outcome so the event loop never logs
+        "exception was never retrieved" for tasks we deliberately dropped."""
+        try:
+            task.exception()
+        except (asyncio.CancelledError, Exception):  # pragma: no cover
+            pass
+
+    async def _await_bounded(self, label: str, coro: Any, timeout: float) -> None:
+        """Await ``coro`` under a HARD deadline.
+
+        ``asyncio.wait_for`` is not a hard bound: on timeout it cancels the
+        inner task and then *waits for the cancellation to finish*, so a
+        close that swallows or delays ``CancelledError`` could still hang
+        the caller — the 2026-08-04 failure shape. Run the coroutine as a
+        task, wait with a timeout, and on expiry cancel-and-ABANDON it.
+        """
+        task = asyncio.ensure_future(coro)
+        try:
+            _done, pending = await asyncio.wait({task}, timeout=timeout)
+        except asyncio.CancelledError:
+            task.cancel()
+            task.add_done_callback(self._consume_task_result)
+            raise
+        if pending:
+            task.cancel()
+            task.add_done_callback(self._consume_task_result)
+            logger.warning(
+                "[Slack] %s did not finish within %.0fs; abandoning it",
+                label,
+                timeout,
+            )
+        elif not task.cancelled() and task.exception() is not None:
+            logger.warning(
+                "[Slack] %s failed: %s", label, task.exception()
+            )
+
+    @staticmethod
+    def _task_is_socket_client_reconnect(task: "asyncio.Task", client: Any) -> bool:
+        """True when ``task`` is executing ``client``'s own connect machinery.
+
+        Matching every task bound to the client would also catch live
+        ``run_message_listeners`` dispatches — i.e. inbound messages being
+        handled right now — and cancelling those loses real messages (their
+        ts is already recorded by dedup, so Slack's redelivery would be
+        dropped). Walk the await chain instead and match only tasks
+        currently inside ``connect`` / ``connect_to_new_endpoint``.
+        """
+        try:
+            coro = task.get_coro()
+            frame = getattr(coro, "cr_frame", None)
+            if frame is None or frame.f_locals.get("self") is not client:
+                return False
+            reconnect_names = {"connect", "connect_to_new_endpoint"}
+            depth = 0
+            while coro is not None and depth < 50:
+                code = getattr(coro, "cr_code", None)
+                inner_frame = getattr(coro, "cr_frame", None)
+                if (
+                    code is not None
+                    and code.co_name in reconnect_names
+                    and inner_frame is not None
+                    and inner_frame.f_locals.get("self") is client
+                ):
+                    return True
+                coro = getattr(coro, "cr_await", None)
+                depth += 1
+            return False
+        except Exception:  # pragma: no cover - introspection is best-effort
+            return False
+
+    async def _cancel_socket_client_tasks(self, client: Any) -> None:
+        """Cancel every asyncio task still running on an old SocketModeClient.
+
+        slack_sdk's ``SocketModeClient.close()`` cancels the tasks it tracks
+        (message processor, session monitor, message receiver) but not the
+        anonymous ``run_message_listeners`` futures it spawns per envelope —
+        and a Slack ``disconnect`` envelope routes one of those into
+        ``connect()``, a bare ``while True`` retry loop that never checks
+        ``self.closed``. After ``close_async()`` that loop survives and logs
+        "Failed to connect (error: Session is closed); Retrying..." every 10s
+        forever (observed 2026-08-04, raced against our own restart). Sweep
+        the event loop for tasks still bound to the old client and cancel
+        them for real.
+        """
+        if client is None:
+            return
+
+        tasks: set = set()
+        for attr in (
+            "message_processor",
+            "current_session_monitor",
+            "message_receiver",
+        ):
+            candidate = getattr(client, attr, None)
+            if isinstance(candidate, asyncio.Future) and not candidate.done():
+                tasks.add(candidate)
+
+        current = asyncio.current_task()
+        for candidate in asyncio.all_tasks():
+            if candidate is current or candidate.done() or candidate in tasks:
+                continue
+            if self._task_is_socket_client_reconnect(candidate, client):
+                tasks.add(candidate)
+
+        if not tasks:
+            return
+
+        logger.info(
+            "[Slack] Cancelling %d leftover task(s) from the old Socket Mode client",
+            len(tasks),
+        )
+        for candidate in tasks:
+            candidate.cancel()
+        done, pending = await asyncio.wait(tasks, timeout=5.0)
+        for finished in done:
+            # Retrieve results so the loop never logs "exception was never
+            # retrieved" for tasks we deliberately killed.
+            if finished.cancelled():
+                continue
+            exc = finished.exception()
+            if exc is not None:
+                logger.debug(
+                    "[Slack] Old Socket Mode client task exited with: %s", exc
+                )
+        if pending:
+            logger.warning(
+                "[Slack] %d old Socket Mode client task(s) survived cancellation",
+                len(pending),
+            )
+
+    def _note_socket_delivery(self) -> None:
+        """Record proof that the Socket Mode session can deliver events."""
+        if self._poll_dispatch_win_streak:
+            logger.info(
+                "[Slack] Socket Mode delivery resumed after %d poll-dispatch win(s)",
+                self._poll_dispatch_win_streak,
+            )
+        self._poll_dispatch_win_streak = 0
+
     async def _restart_socket_mode(self, reason: str) -> None:
         """Reconnect Socket Mode without rebuilding adapter state."""
         if not self._running:
             return
 
-        async with self._socket_reconnect_lock:
+        # Bounded lock acquisition so a wedged restart can never freeze every
+        # later health check behind it. ``asyncio.timeout`` + ``acquire``
+        # rather than ``wait_for(acquire())``: a cancellation that lands
+        # after the lock is granted but before ``wait_for`` returns would
+        # leak the lock forever; ``Lock.acquire`` itself is cancellation-safe.
+        generation = self._socket_restart_generation
+        try:
+            async with asyncio.timeout(5.0):
+                await self._socket_reconnect_lock.acquire()
+        except TimeoutError:
+            logger.warning(
+                "[Slack] Socket Mode restart (%s) skipped; another restart is in flight",
+                reason,
+            )
+            return
+
+        try:
+            # Coalesce: if a restart completed while this request was queued
+            # on the lock, doing it again would tear down the fresh handler.
+            if self._socket_restart_generation != generation:
+                logger.info(
+                    "[Slack] Socket Mode restart (%s) skipped; already restarted",
+                    reason,
+                )
+                return
+
             if not self._running or not self._app or not self._app_token:
                 return
 
             logger.warning("[Slack] Socket Mode unhealthy (%s); reconnecting", reason)
-            await self._stop_socket_mode_handler()
+            # Belt and braces on top of the bounded awaits inside
+            # ``_stop_socket_mode_handler``: nothing in the stop path may ever
+            # block the watchdog loop indefinitely (defect of 2026-08-04).
+            try:
+                await asyncio.wait_for(
+                    self._stop_socket_mode_handler(),
+                    timeout=self._socket_stop_timeout_s * 3,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "[Slack] Socket Mode stop timed out after %.0fs; "
+                    "abandoning the old handler and starting fresh",
+                    self._socket_stop_timeout_s * 3,
+                )
+
+            # A fresh session starts with a clean deaf-socket score.
+            self._poll_dispatch_win_streak = 0
+
+            # Re-check after the stop: a disconnect() may have begun while we
+            # were stopping the old handler; never start a replacement for an
+            # adapter that is shutting down. (No await between this check and
+            # the synchronous start below, so the check cannot go stale.)
+            if not self._running or not self._app or not self._app_token:
+                return
 
             try:
                 self._start_socket_mode_handler()
+                self._socket_restart_generation += 1
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.error(
                     "[Slack] Socket Mode reconnect failed: %s", exc, exc_info=True
                 )
+        finally:
+            self._socket_reconnect_lock.release()
 
     async def _socket_watchdog_loop(self) -> None:
         """Monitor Socket Mode and reconnect if the task/transport dies.
@@ -506,6 +744,30 @@ class SlackAdapter(BasePlatformAdapter):
                 connected = await self._socket_transport_connected()
                 if connected is False:
                     await self._restart_socket_mode("transport disconnected")
+                    continue
+
+                # Deaf-socket detection: ``is_connected`` stays True for a
+                # session that delivers no events (observed 2026-08-04 — three
+                # freshly "established" sessions were deaf all day). When the
+                # polling fallback keeps beating the socket to inbound
+                # messages, the session is not delivering; recycle it.
+                threshold = self._slack_deaf_socket_poll_wins()
+                streak = self._poll_dispatch_win_streak
+                last_deaf_restart = self._deaf_socket_restart_at
+                if (
+                    threshold > 0
+                    and streak >= threshold
+                    and (
+                        last_deaf_restart is None
+                        or time.monotonic() - last_deaf_restart
+                        >= self._slack_deaf_socket_cooldown()
+                    )
+                ):
+                    self._deaf_socket_restart_at = time.monotonic()
+                    await self._restart_socket_mode(
+                        f"deaf socket: polling fallback delivered the last "
+                        f"{streak} message(s) the socket never did"
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - defensive logging
@@ -850,6 +1112,7 @@ class SlackAdapter(BasePlatformAdapter):
             self._bot_user_id = None
             self._team_clients = {}
             self._team_bot_user_ids = {}
+            self._poll_dispatch_win_streak = 0
 
             # First token is the primary — used for AsyncApp / Socket Mode
             primary_token = bot_tokens[0]
@@ -1124,6 +1387,11 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Disconnect from Slack."""
+        # Flip ``_running`` first so any concurrent watchdog iteration,
+        # task-done callback, or in-flight ``_restart_socket_mode`` observes
+        # the shutdown and refuses to start a replacement handler.
+        self._running = False
+
         if self._polling_task:
             self._polling_task.cancel()
             try:
@@ -1135,11 +1403,11 @@ class SlackAdapter(BasePlatformAdapter):
             self._polling_task = None
 
         if self._handler:
-            try:
-                await self._handler.close_async()
-            except Exception as e:  # pragma: no cover - defensive logging
-                logger.warning("[Slack] Error while closing Socket Mode handler: %s", e, exc_info=True)
-        self._running = False
+            await self._await_bounded(
+                "Socket Mode handler close (disconnect)",
+                self._handler.close_async(),
+                self._socket_stop_timeout_s,
+            )
 
         watchdog_task = self._socket_watchdog_task
         self._socket_watchdog_task = None
@@ -1188,6 +1456,31 @@ class SlackAdapter(BasePlatformAdapter):
             return max(60.0, float(raw))
         except (TypeError, ValueError):
             return 900.0
+
+    def _slack_deaf_socket_poll_wins(self) -> int:
+        """Poll-dispatch wins in a row that mark a connected socket as deaf.
+
+        0 disables deaf-socket detection — for deployments where polled
+        channels legitimately never produce Socket Mode events, so every
+        poll dispatch would count as a win and force needless restarts.
+        """
+        raw = self.config.extra.get("deaf_socket_poll_wins")
+        if raw in (None, ""):
+            raw = os.getenv("SLACK_DEAF_SOCKET_POLL_WINS", "3")
+        try:
+            return max(0, int(str(raw).strip()))
+        except (TypeError, ValueError):
+            return 3
+
+    def _slack_deaf_socket_cooldown(self) -> float:
+        """Minimum seconds between deaf-socket-triggered restarts."""
+        raw = self.config.extra.get("deaf_socket_restart_cooldown_seconds")
+        if raw in (None, ""):
+            raw = os.getenv("SLACK_DEAF_SOCKET_RESTART_COOLDOWN_SECONDS", "300")
+        try:
+            return max(30.0, float(raw))
+        except (TypeError, ValueError):
+            return 300.0
 
     def _slack_suppress_internal_terms_channels(self) -> List[str]:
         raw = (
@@ -1560,7 +1853,7 @@ class SlackAdapter(BasePlatformAdapter):
                 ts,
                 event.get("thread_ts", ""),
             )
-            await self._handle_slack_message(event)
+            await self._handle_slack_message(event, origin="poll")
 
     def _get_client(self, chat_id: str) -> Any:
         """Return the workspace-specific WebClient for a channel."""
@@ -1839,7 +2132,7 @@ class SlackAdapter(BasePlatformAdapter):
         cache = getattr(self, "_conv_style_cache", None)
         if not cache or cache.get("mtime") != mtime:
             try:
-                with open(path) as _fh:
+                with open(path, encoding="utf-8") as _fh:
                     data = json.load(_fh)
             except Exception:
                 data = {}
@@ -2804,8 +3097,19 @@ class SlackAdapter(BasePlatformAdapter):
             fallback_event["thread_ts"] = thread_ts
         await self._handle_slack_message(fallback_event)
 
-    async def _handle_slack_message(self, event: dict) -> None:
-        """Handle an incoming Slack message event."""
+    async def _handle_slack_message(self, event: dict, origin: str = "socket") -> None:
+        """Handle an incoming Slack message event.
+
+        ``origin`` marks the delivery path — ``"socket"`` for Socket Mode
+        events, ``"poll"`` for the Web API polling fallback — and feeds
+        deaf-socket detection.
+        """
+        if origin == "socket":
+            # A socket delivery proves the session isn't deaf even when the
+            # polling fallback dispatched this same message first, so note it
+            # before the dedup below can drop the event.
+            self._note_socket_delivery()
+
         # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777)
         event_ts = event.get("ts", "")
         if event_ts and self._dedup.is_duplicate(event_ts):
@@ -2836,6 +3140,21 @@ class SlackAdapter(BasePlatformAdapter):
         subtype = event.get("subtype")
         if subtype in {"message_changed", "message_deleted"}:
             return
+
+        # Deaf-socket detection: a healthy Socket Mode session delivers
+        # channel messages near-instantly, so the polling fallback (interval
+        # >= 2s) should almost never reach this point first — and when the
+        # socket does deliver the same message a beat later, the streak
+        # resets at the top of this handler. A growing streak therefore
+        # means the socket is delivering nothing at all.
+        if origin == "poll":
+            self._poll_dispatch_win_streak += 1
+            logger.info(
+                "[Slack] Polling fallback beat the socket to message ts=%s "
+                "(%d consecutive win(s))",
+                event_ts,
+                self._poll_dispatch_win_streak,
+            )
 
         original_text = event.get("text", "")
 
